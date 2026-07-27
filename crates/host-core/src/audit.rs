@@ -8,18 +8,13 @@ use std::path::Path;
 
 /// Outcome of an audited operation. Aligns with NIST SP 800-53 AU-3 which
 /// requires every record to carry success/failure status.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
+    #[default]
     Success,
     Denied,
     Failed,
-}
-
-impl Default for Outcome {
-    fn default() -> Self {
-        Outcome::Success
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

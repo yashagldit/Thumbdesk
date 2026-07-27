@@ -424,7 +424,7 @@ pub struct AlertPayload {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SignalEnvelope {
     #[serde(rename = "type")]
     pub message_type: String,
@@ -435,6 +435,51 @@ pub struct SignalEnvelope {
     pub reason: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl SignalEnvelope {
+    /// A bare signal of the given type; every other field defaults to `None`/empty.
+    pub fn new(message_type: impl Into<String>) -> Self {
+        Self {
+            message_type: message_type.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A signal addressed at a specific mobile device via the `target_mobile_device_id` extra.
+    pub fn targeted(message_type: impl Into<String>, mobile_device_id: impl Into<String>) -> Self {
+        Self::new(message_type).with_extra("target_mobile_device_id", mobile_device_id.into())
+    }
+
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
+        self.payload = Some(payload);
+        self
+    }
+
+    pub fn with_state(mut self, state: impl Into<String>) -> Self {
+        self.state = Some(state.into());
+        self
+    }
+
+    pub fn with_accepted(mut self, accepted: bool) -> Self {
+        self.accepted = Some(accepted);
+        self
+    }
+
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+
+    pub fn with_extra(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        self.extra.insert(key.into(), value.into());
+        self
+    }
 }
 
 #[cfg(test)]

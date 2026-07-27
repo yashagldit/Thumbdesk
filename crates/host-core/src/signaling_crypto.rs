@@ -248,7 +248,17 @@ pub struct SignedX25519KeyResponse {
     pub ts: i64,
 }
 
-fn canonical_signing_payload(sdp_type: &str, nonce_b64: &str, ts: i64, sdp: &str) -> String {
+/// The exact byte string covered by an SDP signature. Both the signing path
+/// (`sign_sdp`) and the verifying path (`daemon::auth::verify_signed_sdp_payload`)
+/// MUST go through this function — if the two ever spell the format out
+/// separately they can silently drift and every signature check becomes a no-op
+/// against a differently-framed payload.
+pub(crate) fn canonical_signing_payload(
+    sdp_type: &str,
+    nonce_b64: &str,
+    ts: i64,
+    sdp: &str,
+) -> String {
     format!(
         "{}|{}|{}|{}|{}",
         SDP_SIGNING_PREFIX, sdp_type, nonce_b64, ts, sdp
@@ -385,7 +395,7 @@ pub(crate) fn parse_ed25519_signing_key(private_key_b64: &str) -> Result<Signing
     }
     let mut arr: zeroize::Zeroizing<[u8; 32]> = zeroize::Zeroizing::new([0u8; 32]);
     arr.copy_from_slice(&bytes);
-    Ok(SigningKey::from_bytes(&*arr))
+    Ok(SigningKey::from_bytes(&arr))
 }
 
 /// Sign an outgoing SDP offer/answer with the host's ED25519 identity key.
@@ -650,7 +660,7 @@ mod tests {
         // Not base64
         assert!(sign_sdp("!!not-base64!!", "sdp", "offer").is_err());
         // Wrong length
-        let short = base64::engine::general_purpose::STANDARD.encode(&[0u8; 16]);
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
         assert!(sign_sdp(&short, "sdp", "offer").is_err());
     }
 
@@ -938,11 +948,11 @@ mod tests {
     #[test]
     fn test_invalid_public_key_rejected() {
         // Too short
-        let short = base64::engine::general_purpose::STANDARD.encode(&[0u8; 16]);
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
         assert!(parse_x25519_public_key(&short).is_err());
 
         // Too long
-        let long = base64::engine::general_purpose::STANDARD.encode(&[0u8; 64]);
+        let long = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
         assert!(parse_x25519_public_key(&long).is_err());
 
         // Invalid base64

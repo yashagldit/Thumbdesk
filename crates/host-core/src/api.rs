@@ -8,6 +8,7 @@ use crate::models::{
 use crate::secure::parse_jwt_exp;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
+use std::time::Duration;
 
 /// Domain-separation tag for the host signing-key reauth payload. MUST match
 /// `HOST_REAUTH_SIGNING_PREFIX` in `app/services/auth_service.py`; changing
@@ -43,11 +44,30 @@ pub struct BackendClient {
     client: Client,
 }
 
+/// Total deadline for a control-plane request. Every endpoint on this client is
+/// a short JSON REST call (no streaming, no long-polling), so a total timeout is
+/// safe here — unlike the dev-server proxy in `http_forward`, which deliberately
+/// omits one so SSE streams aren't cut off mid-flight.
+///
+/// This bound matters beyond politeness: the daemon awaits several of these
+/// calls *inline* in its control-plane `select!` loop, so an unbounded request
+/// against a black-holed backend wedges the entire loop — the same failure shape
+/// as the `close_peer`/`get_stats` hang.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl BackendClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        let client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            // `Client::builder().build()` only fails if the TLS backend can't
+            // initialize, in which case a default client would fail too.
+            .unwrap_or_else(|_| Client::new());
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client,
         }
     }
 
