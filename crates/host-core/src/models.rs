@@ -252,14 +252,44 @@ pub struct AttachTarget {
 }
 
 /// Rich session info returned by the backend's active-sessions endpoint.
+///
+/// Decoding is deliberately total: this used to be plucked field-by-field out
+/// of a `serde_json::Value`, so a missing *or wrongly-typed* field degraded to
+/// empty/`None` instead of failing the whole response. The `lenient_*`
+/// deserializers below preserve that exact tolerance — one bad row from the
+/// backend must not blank the daemon's view of its active sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendSessionInfo {
+    #[serde(default, deserialize_with = "lenient_string")]
     pub id: String,
+    #[serde(default, deserialize_with = "lenient_string")]
     pub state: String,
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub started_at: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub ended_at: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub connection_mode: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt_string")]
     pub mobile_device_id: Option<String>,
+}
+
+/// Any JSON value -> the string it holds, or `""` if it isn't a string.
+fn lenient_string<'de, D>(de: D) -> std::result::Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(de)?;
+    Ok(v.as_str().unwrap_or_default().to_string())
+}
+
+/// Any JSON value -> `Some(string)` only when it actually is a string.
+fn lenient_opt_string<'de, D>(de: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(de)?;
+    Ok(v.as_str().map(|s| s.to_string()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

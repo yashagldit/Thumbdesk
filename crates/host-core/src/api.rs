@@ -5,9 +5,9 @@ use crate::models::{
     PairingValidateRequest, PairingValidateResponse, SessionState, TokenPairResponse,
     TrustedDeviceRecord,
 };
-use crate::secure::parse_jwt_exp;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use reqwest::{Client, StatusCode};
+use reqwest::header::AUTHORIZATION;
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use serde::de::DeserializeOwned;
 use std::time::Duration;
 
 /// Domain-separation tag for the host signing-key reauth payload. MUST match
@@ -56,7 +56,123 @@ pub struct BackendClient {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Where the human-readable detail of a non-2xx response comes from.
+///
+/// Kept explicit because the two flavours are not interchangeable: reading the
+/// body consumes the response (and costs a round-trip on large errors), while
+/// `Status` only formats the code. Endpoints historically picked one or the
+/// other, and the message text is asserted by tests, so the choice is part of
+/// each endpoint's declared policy rather than something to normalize.
+#[derive(Clone, Copy, PartialEq)]
+enum Detail {
+    Body,
+    Status,
+}
+
+/// Per-endpoint declaration of how non-2xx statuses are classified.
+///
+/// The point of this type is that an endpoint's error policy is now *one
+/// visible argument* instead of a hand-rolled `if` ladder. The asymmetries
+/// between endpoints (notably: several do not map 401 to `AuthRevoked`) are
+/// preserved verbatim — they are now reviewable in one place instead of
+/// hiding in twenty near-identical ladders.
+#[derive(Clone, Copy)]
+struct ErrorPolicy {
+    /// 401 -> `HostError::AuthRevoked`, so the daemon escalates to
+    /// refresh/reauth instead of treating the endpoint as merely broken.
+    revoked_on_401: bool,
+    /// 403 -> `HostError::HostGone` (ownership check failed: host deleted).
+    host_gone_on_403: bool,
+    /// 404 -> `HostError::HostGone` (host row no longer exists).
+    host_gone_on_404: bool,
+    detail: Detail,
+}
+
+impl ErrorPolicy {
+    /// Generic failures report the response body.
+    fn body() -> Self {
+        Self {
+            revoked_on_401: false,
+            host_gone_on_403: false,
+            host_gone_on_404: false,
+            detail: Detail::Body,
+        }
+    }
+
+    /// Generic failures report only the status code.
+    fn status() -> Self {
+        Self {
+            detail: Detail::Status,
+            ..Self::body()
+        }
+    }
+
+    fn revoked_on_401(mut self) -> Self {
+        self.revoked_on_401 = true;
+        self
+    }
+
+    fn host_gone_on_403(mut self) -> Self {
+        self.host_gone_on_403 = true;
+        self
+    }
+
+    fn host_gone_on_404(mut self) -> Self {
+        self.host_gone_on_404 = true;
+        self
+    }
+}
+
 impl BackendClient {
+    /// Attach the host bearer token. Every authenticated endpoint goes through
+    /// here so the header shape is spelled once.
+    fn authed(&self, rb: RequestBuilder, token: &str) -> RequestBuilder {
+        rb.header(AUTHORIZATION, format!("Bearer {token}"))
+    }
+
+    /// Send a request, mapping transport errors to `HostError::Backend`.
+    async fn send(rb: RequestBuilder) -> Result<Response> {
+        rb.send()
+            .await
+            .map_err(|e| HostError::Backend(e.to_string()))
+    }
+
+    /// Apply an endpoint's [`ErrorPolicy`] to the response status.
+    ///
+    /// Returns the response untouched on 2xx. `ctx` is the failure prefix,
+    /// e.g. `"token refresh failed"` -> `"token refresh failed: <detail>"`.
+    async fn check(res: Response, ctx: &str, policy: ErrorPolicy) -> Result<Response> {
+        let status = res.status();
+
+        if policy.revoked_on_401 && status == StatusCode::UNAUTHORIZED {
+            return Err(HostError::AuthRevoked);
+        }
+        if (policy.host_gone_on_403 && status == StatusCode::FORBIDDEN)
+            || (policy.host_gone_on_404 && status == StatusCode::NOT_FOUND)
+        {
+            return Err(HostError::HostGone);
+        }
+        if status.is_success() {
+            return Ok(res);
+        }
+
+        Err(HostError::Backend(match policy.detail {
+            Detail::Body => {
+                let body = res.text().await.unwrap_or_default();
+                format!("{ctx}: {body}")
+            }
+            Detail::Status => format!("{ctx}: {status}"),
+        }))
+    }
+
+    /// Decode a JSON body. `ctx` is the noun in `"invalid <ctx>: <err>"`,
+    /// e.g. `"refresh payload"` or `"approve response"`.
+    async fn parse<T: DeserializeOwned>(res: Response, ctx: &str) -> Result<T> {
+        res.json::<T>()
+            .await
+            .map_err(|e| HostError::Backend(format!("invalid {ctx}: {e}")))
+    }
+
     pub fn new(base_url: impl Into<String>) -> Self {
         let client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -73,27 +189,20 @@ impl BackendClient {
 
     pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<TokenPairResponse> {
         let url = format!("{}/api/v1/auth/token/refresh", self.base_url);
-        let res = self
-            .client
-            .post(url)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&serde_json::json!({"refresh_token": refresh_token}))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(
+            self.client
+                .post(url)
+                .json(&serde_json::json!({"refresh_token": refresh_token})),
+        )
+        .await?;
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
-
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!("token refresh failed: {body}")));
-        }
-
-        res.json::<TokenPairResponse>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid refresh payload: {e}")))
+        let res = Self::check(
+            res,
+            "token refresh failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
+        Self::parse(res, "refresh payload").await
     }
 
     /// Re-authenticate as a host using its permanent Ed25519 signing key.
@@ -115,29 +224,20 @@ impl BackendClient {
         signature_b64: &str,
     ) -> Result<TokenPairResponse> {
         let url = format!("{}/api/v1/auth/host/reauth", self.base_url);
-        let res = self
-            .client
-            .post(url)
-            .header(CONTENT_TYPE, "application/json")
-            .json(&serde_json::json!({
-                "host_id": host_id,
-                "issued_at": issued_at_iso8601,
-                "signature": signature_b64,
-            }))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.client.post(url).json(&serde_json::json!({
+            "host_id": host_id,
+            "issued_at": issued_at_iso8601,
+            "signature": signature_b64,
+        })))
+        .await?;
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!("host reauth failed: {body}")));
-        }
-        res.json::<TokenPairResponse>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid reauth payload: {e}")))
+        let res = Self::check(
+            res,
+            "host reauth failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
+        Self::parse(res, "reauth payload").await
     }
 
     /// Revoke a refresh token server-side. Called on `pocketshell logout`
@@ -146,18 +246,18 @@ impl BackendClient {
     /// has already been cleared by the time we return.
     pub async fn logout(&self, refresh_token: &str) -> Result<()> {
         let url = format!("{}/api/v1/auth/logout", self.base_url);
+        // NOTE: unlike every other endpoint this labels the *transport* error
+        // ("logout request failed") rather than using the bare reqwest string,
+        // so it does not use the shared `send` helper.
         let res = self
             .client
             .post(url)
-            .header(CONTENT_TYPE, "application/json")
             .json(&serde_json::json!({"refresh_token": refresh_token}))
             .send()
             .await
             .map_err(|e| HostError::Backend(format!("logout request failed: {e}")))?;
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!("logout failed: {body}")));
-        }
+
+        Self::check(res, "logout failed", ErrorPolicy::body()).await?;
         Ok(())
     }
 
@@ -166,24 +266,12 @@ impl BackendClient {
         payload: &PairingValidateRequest,
     ) -> Result<PairingValidateResponse> {
         let url = format!("{}/api/v1/pairing/codes/validate", self.base_url);
-        let res = self
-            .client
-            .post(url)
-            .json(payload)
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.client.post(url).json(payload)).await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!(
-                "pairing validate failed: {body}"
-            )));
-        }
-
-        res.json::<PairingValidateResponse>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid host registration payload: {e}")))
+        // No 401 arm: unauthenticated endpoint, a 401 here is not a revoked
+        // host token. (Asymmetry preserved deliberately.)
+        let res = Self::check(res, "pairing validate failed", ErrorPolicy::body()).await?;
+        Self::parse(res, "host registration payload").await
     }
 
     /// Start a host-initiated pairing claim. No auth required.
@@ -201,24 +289,15 @@ impl BackendClient {
             public_key: public_key.to_string(),
             app_version: app_version.to_string(),
         };
-        let res = self
-            .client
-            .post(url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.client.post(url).json(&payload)).await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!(
-                "host-initiated pairing start failed: {body}"
-            )));
-        }
-
-        res.json::<HostInitiatedCreateResponse>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid host-initiated create payload: {e}")))
+        let res = Self::check(
+            res,
+            "host-initiated pairing start failed",
+            ErrorPolicy::body(),
+        )
+        .await?;
+        Self::parse(res, "host-initiated create payload").await
     }
 
     /// Start a host-initiated device-add claim. Requires host auth (Bearer access token).
@@ -232,38 +311,19 @@ impl BackendClient {
         let payload = HostInitiatedDeviceAddRequest {
             existing_host_id: host_id.to_string(),
         };
-        let res = self
-            .client
-            .post(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
-
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
+        let res = Self::send(self.authed(self.client.post(url), token).json(&payload)).await?;
 
         // 403 on this endpoint means the backend doesn't recognize this host as
         // owned by the authenticated user — typically because the host was
         // deleted from the mobile app. Surface as HostGone so the caller can
         // auto-recover by re-registering as a new host.
-        if res.status() == StatusCode::FORBIDDEN {
-            return Err(HostError::HostGone);
-        }
-
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!(
-                "host-initiated device-add start failed: {body}"
-            )));
-        }
-
-        res.json::<HostInitiatedCreateResponse>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid host-initiated create payload: {e}")))
+        let res = Self::check(
+            res,
+            "host-initiated device-add start failed",
+            ErrorPolicy::body().revoked_on_401().host_gone_on_403(),
+        )
+        .await?;
+        Self::parse(res, "host-initiated create payload").await
     }
 
     /// Poll the status of a host-initiated claim. No auth required.
@@ -272,21 +332,21 @@ impl BackendClient {
         claim_token: &str,
     ) -> Result<HostInitiatedPollOutcome> {
         let url = format!("{}/api/v1/pairing/host-initiated/status", self.base_url);
-        let res = self
-            .client
-            .post(url)
-            .json(&serde_json::json!({ "claim_token": claim_token }))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(
+            self.client
+                .post(url)
+                .json(&serde_json::json!({ "claim_token": claim_token })),
+        )
+        .await?;
 
+        // Bespoke ladder: 410/404 are *successful* domain outcomes here, not
+        // errors, so this endpoint can't express its policy via `check`.
         match res.status() {
             StatusCode::GONE => Ok(HostInitiatedPollOutcome::AlreadyDelivered),
             StatusCode::NOT_FOUND => Ok(HostInitiatedPollOutcome::Expired),
             s if s.is_success() => {
-                let body: HostInitiatedStatusResponse = res.json().await.map_err(|e| {
-                    HostError::Backend(format!("invalid host-initiated status payload: {e}"))
-                })?;
+                let body: HostInitiatedStatusResponse =
+                    Self::parse(res, "host-initiated status payload").await?;
                 if body.status == "claimed" {
                     Ok(HostInitiatedPollOutcome::Claimed(Box::new(body)))
                 } else {
@@ -311,32 +371,17 @@ impl BackendClient {
             "{}/api/v1/presence/hosts/{}/heartbeat",
             self.base_url, payload.host_id
         );
-        let res = self
-            .client
-            .post(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(CONTENT_TYPE, "application/json")
-            .json(payload)
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.authed(self.client.post(url), token).json(payload)).await?;
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
-
-        if !res.status().is_success() {
-            return Err(HostError::Backend(format!(
-                "presence heartbeat failed: {}",
-                res.status()
-            )));
-        }
+        let res = Self::check(
+            res,
+            "presence heartbeat failed",
+            ErrorPolicy::status().revoked_on_401(),
+        )
+        .await?;
 
         // Check if backend is requesting an action (e.g. kill for free-tier)
-        let body: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid heartbeat response: {e}")))?;
+        let body: serde_json::Value = Self::parse(res, "heartbeat response").await?;
 
         if let Some(action) = body.get("action").and_then(|v| v.as_str()) {
             if action == "kill" {
@@ -352,48 +397,21 @@ impl BackendClient {
             "{}/api/v1/presence/hosts/{}/offline",
             self.base_url, host_id
         );
-        let res = self
-            .client
-            .post(&url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.authed(self.client.post(&url), token)).await?;
 
-        if !res.status().is_success() {
-            return Err(HostError::Backend(format!(
-                "mark offline failed: {}",
-                res.status()
-            )));
-        }
+        // No 401 arm today: a revoked token here is reported as a plain
+        // Backend error. (Asymmetry preserved deliberately.)
+        Self::check(res, "mark offline failed", ErrorPolicy::status()).await?;
         Ok(())
     }
 
     /// Fetch the authenticated user's profile (email, display name).
     pub async fn get_me(&self, token: &str) -> Result<crate::models::UserProfile> {
         let url = format!("{}/api/v1/users/me", self.base_url);
-        let res = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
-
-        if !res.status().is_success() {
-            return Err(HostError::Backend(format!(
-                "get_me failed: {}",
-                res.status()
-            )));
-        }
-
-        res.json::<crate::models::UserProfile>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid user profile payload: {e}")))
+        let res = Self::check(res, "get_me failed", ErrorPolicy::status().revoked_on_401()).await?;
+        Self::parse(res, "user profile payload").await
     }
 
     pub async fn list_trusted_devices(
@@ -402,36 +420,22 @@ impl BackendClient {
         host_id: &str,
     ) -> Result<Vec<TrustedDeviceRecord>> {
         let url = format!("{}/api/v1/hosts/{}/trusted-devices", self.base_url, host_id);
-        let res = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
-
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
 
         // 404 here means the user deleted this host from the mobile app —
         // backend's trusted_device_service raises 404 "Host not found" when
         // the host_id no longer maps to a row owned by the authenticated user.
         // 403 is the same outcome for ownership-check failures elsewhere.
-        if res.status() == StatusCode::NOT_FOUND || res.status() == StatusCode::FORBIDDEN {
-            return Err(HostError::HostGone);
-        }
-
-        if !res.status().is_success() {
-            return Err(HostError::Backend(format!(
-                "trusted-device list failed: {}",
-                res.status()
-            )));
-        }
-
-        res.json::<Vec<TrustedDeviceRecord>>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid trusted-device payload: {e}")))
+        let res = Self::check(
+            res,
+            "trusted-device list failed",
+            ErrorPolicy::status()
+                .revoked_on_401()
+                .host_gone_on_403()
+                .host_gone_on_404(),
+        )
+        .await?;
+        Self::parse(res, "trusted-device payload").await
     }
 
     pub async fn approve_device(
@@ -444,26 +448,18 @@ impl BackendClient {
             "{}/api/v1/hosts/{}/trusted-devices/approve",
             self.base_url, host_id
         );
-        let res = self
-            .client
-            .post(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .json(&serde_json::json!({
+        let res = Self::send(self.authed(self.client.post(url), token).json(
+            &serde_json::json!({
                 "mobile_device_id": mobile_device_id,
                 "permissions_json": {"terminal": true, "stats": true}
-            }))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+            }),
+        ))
+        .await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!("approve failed: {body}")));
-        }
-
-        res.json::<TrustedDeviceRecord>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid approve response: {e}")))
+        // No 401/403 arms today despite being an authenticated, host-scoped
+        // endpoint. (Asymmetry preserved deliberately.)
+        let res = Self::check(res, "approve failed", ErrorPolicy::body()).await?;
+        Self::parse(res, "approve response").await
     }
 
     pub async fn revoke_device(
@@ -476,23 +472,15 @@ impl BackendClient {
             "{}/api/v1/hosts/{}/trusted-devices/revoke",
             self.base_url, host_id
         );
-        let res = self
-            .client
-            .post(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .json(&serde_json::json!({"mobile_device_id": mobile_device_id}))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(
+            self.authed(self.client.post(url), token)
+                .json(&serde_json::json!({"mobile_device_id": mobile_device_id})),
+        )
+        .await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!("revoke failed: {body}")));
-        }
-
-        res.json::<TrustedDeviceRecord>()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid revoke response: {e}")))
+        // No 401/403 arms today. (Asymmetry preserved deliberately.)
+        let res = Self::check(res, "revoke failed", ErrorPolicy::body()).await?;
+        Self::parse(res, "revoke response").await
     }
 
     pub async fn transition_session(
@@ -508,22 +496,10 @@ impl BackendClient {
             payload["connection_mode"] = serde_json::Value::String(mode.to_string());
         }
 
-        let res = self
-            .client
-            .patch(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.authed(self.client.patch(url), token).json(&payload)).await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!(
-                "session transition failed: {body}"
-            )));
-        }
-
+        // No 401 arm today. (Asymmetry preserved deliberately.)
+        Self::check(res, "session transition failed", ErrorPolicy::body()).await?;
         Ok(())
     }
 
@@ -535,29 +511,18 @@ impl BackendClient {
         host_id: &str,
     ) -> Result<Vec<(String, SessionState)>> {
         let url = format!("{}/api/v1/sessions/host/{}/active", self.base_url, host_id);
-        let res = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
+        let res = Self::check(
+            res,
+            "list active sessions failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!(
-                "list active sessions failed: {body}"
-            )));
-        }
-
-        let body: Vec<serde_json::Value> = res
-            .json()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid sessions payload: {e}")))?;
+        // Kept as raw `Value`: unknown/garbage `state` values are *dropped*
+        // here rather than surfaced, which a typed enum would not reproduce.
+        let body: Vec<serde_json::Value> = Self::parse(res, "sessions payload").await?;
 
         Ok(body
             .into_iter()
@@ -584,61 +549,18 @@ impl BackendClient {
             "{}/api/v1/sessions/host/{}/active?include_pending=true",
             self.base_url, host_id
         );
-        let res = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
+        let res = Self::check(
+            res,
+            "list active sessions failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!(
-                "list active sessions failed: {body}"
-            )));
-        }
-
-        let body: Vec<serde_json::Value> = res
-            .json()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid sessions payload: {e}")))?;
-
-        Ok(body
-            .into_iter()
-            .map(|v| BackendSessionInfo {
-                id: v
-                    .get("id")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                state: v
-                    .get("state")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                started_at: v
-                    .get("started_at")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
-                ended_at: v
-                    .get("ended_at")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
-                connection_mode: v
-                    .get("connection_mode")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
-                mobile_device_id: v
-                    .get("mobile_device_id")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string()),
-            })
-            .collect())
+        // `BackendSessionInfo`'s field attributes carry the same missing-field
+        // and wrong-type tolerance the hand-rolled `Value` plucking used to.
+        Self::parse(res, "sessions payload").await
     }
 
     pub async fn turn_credentials(
@@ -646,25 +568,27 @@ impl BackendClient {
         token: &str,
     ) -> Result<(String, String, i64, Vec<String>)> {
         let url = format!("{}/api/v1/webrtc/turn-credentials", self.base_url);
-        let res = self
-            .client
-            .get(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
 
-        if !res.status().is_success() {
-            let body = res.text().await.unwrap_or_default();
-            return Err(HostError::Backend(format!(
-                "turn credentials request failed: {body}"
-            )));
-        }
+        // A 401 here MUST surface as `AuthRevoked` so the daemon's outer loop
+        // escalates to refresh/reauth. Returning a generic `Backend` error
+        // instead is what makes a rejected host token look like "TURN is
+        // unavailable": every offer then fails, sessions degrade silently to
+        // the backend WS relay (laggy, and with no badge to say so), and the
+        // daemon never tries to re-authenticate because nothing told it the
+        // token was the problem.
+        let res = Self::check(
+            res,
+            "turn credentials request failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
 
-        let body: serde_json::Value = res
-            .json()
-            .await
-            .map_err(|e| HostError::Backend(format!("invalid turn payload: {e}")))?;
+        // Left as raw `Value` on purpose: every field degrades to a default on
+        // a missing *or* wrongly-typed value, and a typed struct would have to
+        // re-implement that leniency to avoid turning a sloppy backend payload
+        // into a hard "TURN is unavailable".
+        let body: serde_json::Value = Self::parse(res, "turn payload").await?;
 
         let username = body
             .get("username")
@@ -695,33 +619,20 @@ impl BackendClient {
 
     pub async fn report_turn_usage(&self, token: &str, bytes_used: u64) -> Result<()> {
         let url = format!("{}/api/v1/webrtc/turn-usage", self.base_url);
-        let res = self
-            .client
-            .post(url)
-            .header(AUTHORIZATION, format!("Bearer {token}"))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&serde_json::json!({ "bytes_used": bytes_used }))
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(e.to_string()))?;
+        let res = Self::send(
+            self.authed(self.client.post(url), token)
+                .json(&serde_json::json!({ "bytes_used": bytes_used })),
+        )
+        .await?;
 
-        if res.status() == StatusCode::UNAUTHORIZED {
-            return Err(HostError::AuthRevoked);
-        }
-
-        if !res.status().is_success() {
-            let status = res.status();
-            return Err(HostError::Backend(format!(
-                "turn usage report failed: {status}"
-            )));
-        }
-
+        Self::check(
+            res,
+            "turn usage report failed",
+            ErrorPolicy::status().revoked_on_401(),
+        )
+        .await?;
         Ok(())
     }
-}
-
-pub fn derive_access_expiry(token: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    parse_jwt_exp(token)
 }
 
 #[cfg(test)]
@@ -1297,6 +1208,26 @@ mod tests {
         assert!(u2.is_empty());
         assert_eq!(ttl2, 0);
         assert!(uris2.is_empty());
+    }
+
+    /// A rejected host token must escalate to `AuthRevoked` so the daemon
+    /// reauthenticates. When this mapped to a generic `Backend` error, a
+    /// backend that stopped accepting host tokens looked like "TURN is down":
+    /// every P2P offer failed and sessions silently degraded to the WS relay.
+    #[tokio::test]
+    async fn turn_credentials_401_is_auth_revoked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/webrtc/turn-credentials"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token rejected"))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let err = c.turn_credentials("tk").await.unwrap_err();
+        assert!(
+            matches!(err, HostError::AuthRevoked),
+            "expected AuthRevoked, got {err:?}"
+        );
     }
 
     #[tokio::test]
