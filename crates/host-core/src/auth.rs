@@ -90,9 +90,32 @@ pub fn refresh_token_jwt_expired(auth: &AuthState) -> bool {
 /// [`refresh_token_jwt_expired`] to distinguish a transient race from a
 /// genuinely-dead token (where re-pairing is required).
 pub async fn safe_refresh_if_needed(backend: &BackendClient, store: &mut StateStore) -> Result<()> {
+    refresh_with_lock(backend, store, false).await
+}
+
+/// Rotate tokens even when the local access token looks nowhere near expiry.
+///
+/// Used when the backend has *rejected* the current access token with a 401 on
+/// a call that has no other explanation (the TURN-credentials fetch). Expiry
+/// says nothing there — the token is locally valid, the server just refuses it
+/// — so [`safe_refresh_if_needed`] would be a no-op and the daemon would keep
+/// presenting a token the backend will not accept.
+///
+/// Failure behavior is identical to the expiry-driven path (including the
+/// signing-key fallback), and `state.auth` is never cleared. Callers MUST
+/// rate-limit: each call burns a refresh-token rotation.
+pub async fn force_refresh(backend: &BackendClient, store: &mut StateStore) -> Result<()> {
+    refresh_with_lock(backend, store, true).await
+}
+
+async fn refresh_with_lock(
+    backend: &BackendClient,
+    store: &mut StateStore,
+    force: bool,
+) -> Result<()> {
     store.require_logged_in()?;
 
-    {
+    if !force {
         let auth = store.state.auth.as_ref().ok_or(HostError::NotLoggedIn)?;
         if !token_is_expiring(auth.access_expires_at, 60) {
             return Ok(());
@@ -107,7 +130,16 @@ pub async fn safe_refresh_if_needed(backend: &BackendClient, store: &mut StateSt
     // before us may have already rotated the token.
     let reloaded = StateStore::load()?;
     let reloaded_auth = reloaded.state.auth.clone().ok_or(HostError::NotLoggedIn)?;
-    if !token_is_expiring(reloaded_auth.access_expires_at, 60) {
+    if force {
+        // Someone else rotated while we waited for the lock. Their token is by
+        // definition newer than the one the backend just rejected — adopt it
+        // instead of burning another rotation on top.
+        let ours = store.state.auth.as_ref().map(|a| a.access_token.as_str());
+        if ours != Some(reloaded_auth.access_token.as_str()) {
+            *store = reloaded;
+            return Ok(());
+        }
+    } else if !token_is_expiring(reloaded_auth.access_expires_at, 60) {
         *store = reloaded;
         return Ok(());
     }
