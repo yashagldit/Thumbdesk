@@ -506,7 +506,11 @@ impl SignalEnvelope {
         self
     }
 
-    pub fn with_extra(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn with_extra(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         self.extra.insert(key.into(), value.into());
         self
     }

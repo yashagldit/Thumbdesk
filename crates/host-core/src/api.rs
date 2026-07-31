@@ -448,12 +448,13 @@ impl BackendClient {
             "{}/api/v1/hosts/{}/trusted-devices/approve",
             self.base_url, host_id
         );
-        let res = Self::send(self.authed(self.client.post(url), token).json(
-            &serde_json::json!({
-                "mobile_device_id": mobile_device_id,
-                "permissions_json": {"terminal": true, "stats": true}
-            }),
-        ))
+        let res = Self::send(
+            self.authed(self.client.post(url), token)
+                .json(&serde_json::json!({
+                    "mobile_device_id": mobile_device_id,
+                    "permissions_json": {"terminal": true, "stats": true}
+                })),
+        )
         .await?;
 
         // No 401/403 arms today despite being an authenticated, host-scoped
