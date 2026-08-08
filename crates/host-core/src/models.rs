@@ -233,6 +233,8 @@ pub struct HeartbeatRequest {
     pub pending_devices: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_capabilities: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
