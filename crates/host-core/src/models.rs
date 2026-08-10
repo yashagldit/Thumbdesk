@@ -274,6 +274,8 @@ pub struct BackendSessionInfo {
     pub connection_mode: Option<String>,
     #[serde(default, deserialize_with = "lenient_opt_string")]
     pub mobile_device_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub purpose: Option<String>,
 }
 
 /// Any JSON value -> the string it holds, or `""` if it isn't a string.
@@ -537,6 +539,21 @@ mod tests {
         assert!(state.trusted_devices.is_empty());
         assert!(state.sessions.is_empty());
         assert!(state.alert_thresholds.is_empty());
+    }
+
+    #[test]
+    fn backend_session_info_decodes_optional_purpose() {
+        let agent: BackendSessionInfo = serde_json::from_value(json!({
+            "id": "s1",
+            "state": "detached",
+            "purpose": "agent"
+        }))
+        .unwrap();
+        assert_eq!(agent.purpose.as_deref(), Some("agent"));
+
+        let legacy: BackendSessionInfo =
+            serde_json::from_value(json!({"id": "s2", "state": "connected"})).unwrap();
+        assert!(legacy.purpose.is_none());
     }
 
     #[test]

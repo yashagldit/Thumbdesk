@@ -1163,7 +1163,8 @@ mod tests {
                     "started_at": "2024-01-01T00:00:00Z",
                     "ended_at": null,
                     "connection_mode": "p2p",
-                    "mobile_device_id": "m1"
+                    "mobile_device_id": "m1",
+                    "purpose": "agent"
                 }
             ])))
             .mount(&server)
@@ -1174,6 +1175,7 @@ mod tests {
         assert_eq!(list[0].id, "s1");
         assert_eq!(list[0].connection_mode.as_deref(), Some("p2p"));
         assert_eq!(list[0].mobile_device_id.as_deref(), Some("m1"));
+        assert_eq!(list[0].purpose.as_deref(), Some("agent"));
         assert!(list[0].ended_at.is_none());
     }
 
