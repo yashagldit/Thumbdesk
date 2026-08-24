@@ -131,6 +131,12 @@ pub struct HostInitiatedCreateRequest {
     pub platform: String,
     pub public_key: String,
     pub app_version: String,
+    /// Proof we hold `public_key`'s private key, signed over
+    /// `HOST_INIT_ATTEST_CONTEXT`. The backend requires it to reattach an
+    /// already-registered host; omitted on the wire when absent so older
+    /// backends keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_attestation: Option<PairAttestation>,
 }
 
 /// Body for the host-authenticated device-add endpoint.

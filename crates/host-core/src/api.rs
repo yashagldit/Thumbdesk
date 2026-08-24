@@ -274,13 +274,16 @@ impl BackendClient {
         Self::parse(res, "host registration payload").await
     }
 
-    /// Start a host-initiated pairing claim. No auth required.
+    /// Start a host-initiated pairing claim. No auth required; `pair_attestation`
+    /// proves possession of `public_key`'s private key and is what lets the
+    /// backend reattach an already-registered host.
     pub async fn start_host_initiated(
         &self,
         hostname: &str,
         platform: &str,
         public_key: &str,
         app_version: &str,
+        pair_attestation: Option<crate::models::PairAttestation>,
     ) -> Result<HostInitiatedCreateResponse> {
         let url = format!("{}/api/v1/pairing/host-initiated", self.base_url);
         let payload = HostInitiatedCreateRequest {
@@ -288,6 +291,7 @@ impl BackendClient {
             platform: platform.to_string(),
             public_key: public_key.to_string(),
             app_version: app_version.to_string(),
+            pair_attestation,
         };
         let res = Self::send(self.client.post(url).json(&payload)).await?;
 
@@ -808,7 +812,7 @@ mod tests {
 
         let c = BackendClient::new(server.uri());
         let resp = c
-            .start_host_initiated("hn", "linux", "pk", "1.0")
+            .start_host_initiated("hn", "linux", "pk", "1.0", None)
             .await
             .unwrap();
         assert_eq!(resp.claim_token, "claim-xyz");

@@ -470,8 +470,14 @@ pub fn sign_x25519_key_response(
 /// against the host-reported pubkey and, on success, upgrades the local pin
 /// source from "backend" to "qr".
 ///
+/// Code-slot value for the QR (host-initiated) flow, which has no pairing
+/// code when the host opens its claim. MUST match
+/// `app/services/pair_attestation.py::HOST_INIT_ATTEST_CONTEXT`.
+pub const HOST_INIT_ATTEST_CONTEXT: &str = "host-initiated-create";
+
 /// Returns the wire-shape `PairAttestation` directly so the agent can drop it
-/// into `PairingValidateRequest.pair_attestation` without remapping fields.
+/// into `PairingValidateRequest.pair_attestation` (or
+/// `HostInitiatedCreateRequest.pair_attestation`) without remapping fields.
 pub fn sign_pair_attestation(
     private_key_b64: &str,
     code: &str,
