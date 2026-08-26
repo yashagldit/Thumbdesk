@@ -11,7 +11,7 @@ use rand::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 
-const PROTOCOL_INFO_PREFIX: &[u8] = b"pocketshell-files-v1";
+pub(crate) const PROTOCOL_INFO_PREFIX: &[u8] = b"pocketshell-files-v1";
 
 /// Shared signing-context prefix for signed SDP envelopes. MUST match the
 /// mobile-side constant in `mobile/src/services/sdpSignature.ts`.
