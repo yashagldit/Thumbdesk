@@ -167,6 +167,10 @@ pub struct HostInitiatedStatusResponse {
     pub mobile_device_id: Option<String>,
     #[serde(default)]
     pub device_public_key: Option<String>,
+    /// The phone's HMAC under the QR's pairing secret (see `pairing_proof`),
+    /// relayed opaquely. Absent from older apps and older backends.
+    #[serde(default)]
+    pub device_proof: Option<String>,
 }
 
 /// Result of polling the host-initiated pairing status endpoint.
