@@ -131,13 +131,100 @@ pub async fn resolve_latest_tag(base_url: &str) -> Result<String> {
     Ok(tag.to_string())
 }
 
-fn build_urls(base_url: &str, tag: &str, target: &str) -> (String, String, String, String) {
+/// `app` selects the macOS app archive (`….app.tar.gz`, a whole
+/// `PocketShell.app`) over the plain binary's.
+fn build_urls(
+    base_url: &str,
+    tag: &str,
+    target: &str,
+    app: bool,
+) -> (String, String, String, String) {
     let base = base_url.trim_end_matches('/');
-    let archive = format!("pocketshell-{tag}-{target}.tar.gz");
+    let suffix = if app { "app.tar.gz" } else { "tar.gz" };
+    let archive = format!("pocketshell-{tag}-{target}.{suffix}");
     let dl = format!("{base}/releases/download/{tag}/{archive}");
     let sha = format!("{dl}.sha256");
     let bundle = format!("{dl}.cosign-bundle.json");
     (archive, dl, sha, bundle)
+}
+
+/// The app bundle `exe` is the main executable of, if it is one:
+/// `/Applications/PocketShell.app` for `…/PocketShell.app/Contents/MacOS/pocketshell`.
+fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    let is_bundle = macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app";
+    is_bundle.then(|| bundle.to_path_buf())
+}
+
+/// Whether this process is the agent inside PocketShell.app. Such an install
+/// updates by replacing the whole app: swapping only the binary would leave
+/// a bundle whose signature no longer matches its contents, and macOS would
+/// treat it as a different, unpermitted program.
+fn running_from_app() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .is_ok_and(|exe| app_bundle_of(&exe).is_some())
+}
+
+/// Whether the release carries the macOS app archive. Any failure counts as
+/// "no": the caller then falls back to the binary archive.
+async fn app_archive_exists(base_url: &str, tag: &str, target: &str) -> bool {
+    let (_, url, _, _) = build_urls(base_url, tag, target, true);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .head(&url)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
+/// Where a first PocketShell.app goes: `/Applications`, or the user's own
+/// `~/Applications` when that is not writable.
+fn app_install_dir() -> Result<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/Applications")];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join("Applications"));
+    }
+    for dir in candidates {
+        let probe = dir.join(format!(".pocketshell-probe-{}", std::process::id()));
+        if fs::create_dir_all(&probe).is_ok() {
+            let _ = fs::remove_dir(&probe);
+            return Ok(dir);
+        }
+    }
+    Err(HostError::Config(
+        "no writable Applications folder to install PocketShell.app into".into(),
+    ))
+}
+
+/// Make `link` a symlink to `target`, replacing whatever is there. Staged
+/// beside it and renamed into place, so the command is never missing and a
+/// process still running the old binary keeps its file.
+fn replace_with_link(link: &Path, target: &Path) -> Result<()> {
+    let staged = with_old_suffix(link).with_extension("new-link");
+    let _ = fs::remove_file(&staged);
+    #[cfg(unix)]
+    let placed = std::os::unix::fs::symlink(target, &staged).and_then(|()| fs::rename(&staged, link));
+    #[cfg(not(unix))]
+    let placed: std::io::Result<()> = Err(std::io::Error::other("links are a macOS install detail"));
+    placed.map_err(|e| {
+        let _ = fs::remove_file(&staged);
+        HostError::Config(format!(
+            "link {} to {}: {e}",
+            link.display(),
+            target.display()
+        ))
+    })
 }
 
 fn normalize(v: &str) -> &str {
@@ -165,8 +252,15 @@ pub async fn check(
         _ => resolve_latest_tag(base_url).await?,
     };
     let target_triple = detect_target()?;
+    // On a Mac the agent lives in PocketShell.app. An install already there
+    // takes the app archive; a loose binary takes it too, and moves into the
+    // app, when the release has one. Releases from before the app existed do
+    // not, and update the binary in place as they always did.
+    let app = running_from_app()
+        || (cfg!(target_os = "macos")
+            && app_archive_exists(base_url, &target_version, &target_triple).await);
     let (archive_name, download_url, checksum_url, cosign_bundle_url) =
-        build_urls(base_url, &target_version, &target_triple);
+        build_urls(base_url, &target_version, &target_triple, app);
     let up_to_date = normalize(&target_version) == normalize(current_version);
     Ok(UpdateInfo {
         current_version: current_version.to_string(),
@@ -252,7 +346,20 @@ pub async fn download_and_install_with(
     let current_exe = std::env::current_exe()
         .and_then(fs::canonicalize)
         .map_err(|e| HostError::Config(format!("resolve current exe: {e}")))?;
-    let install_dir = current_exe
+    // An app archive replaces the bundle, so it is staged beside the bundle;
+    // a binary archive beside the binary. A loose binary handed an app
+    // archive is moving into the app: the app is installed fresh and the
+    // binary's path becomes a link to it.
+    let is_app_archive = info.archive_name.ends_with(".app.tar.gz");
+    let converting = is_app_archive && app_bundle_of(&current_exe).is_none();
+    let app_bundle = match (is_app_archive, app_bundle_of(&current_exe)) {
+        (false, _) => None,
+        (true, Some(bundle)) => Some(bundle),
+        (true, None) => Some(app_install_dir()?.join("PocketShell.app")),
+    };
+    let install_dir = app_bundle
+        .as_deref()
+        .unwrap_or(&current_exe)
         .parent()
         .ok_or_else(|| HostError::Config("current exe has no parent dir".into()))?
         .to_path_buf();
@@ -337,6 +444,29 @@ pub async fn download_and_install_with(
         .map_err(|e| HostError::Config(format!("spawn tar: {e}")))?;
     if !status.success() {
         return Err(HostError::Config("tar extraction failed".into()));
+    }
+
+    if let Some(bundle) = app_bundle {
+        install_app_bundle(&staging, &bundle)?;
+        info!(
+            "installed PocketShell.app {} → {}",
+            info.target_version,
+            bundle.display()
+        );
+        if !converting {
+            return Ok(current_exe);
+        }
+        // The app is in place and is now the only copy: the old binary's
+        // path becomes a link into it, so the command and the running
+        // service both lead there.
+        let binary = bundle.join("Contents/MacOS/pocketshell");
+        replace_with_link(&current_exe, &binary)?;
+        crate::service::repoint_launchd(&current_exe, &binary);
+        info!(
+            "{} is now a link into PocketShell.app",
+            current_exe.display()
+        );
+        return Ok(binary);
     }
 
     // The release tarball carries `pocketshell.exe` on Windows, `pocketshell`
@@ -424,6 +554,67 @@ pub async fn download_and_install_with(
 /// `pocketshell.old` (correct), but on Windows-style paths with extensions
 /// it would replace the extension. Keep both: `pocketshell` → `pocketshell.old`,
 /// `pocketshell.exe` → `pocketshell.exe.old`.
+/// Replace the installed app `bundle` with the `PocketShell.app` extracted
+/// into `staging`. The running process keeps its already-mapped files, as
+/// with a renamed-over binary. No copy of the old app is kept: the app is the
+/// only copy of the agent on a Mac, and a second one would outlive it.
+fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<()> {
+    let new_app = staging.join("PocketShell.app");
+    if !new_app.join("Contents/MacOS/pocketshell").exists() {
+        return Err(HostError::Config(
+            "archive did not contain PocketShell.app".into(),
+        ));
+    }
+    // The same authenticity check the binary gets, on the bundle as a whole:
+    // codesign validates every file in it against the signature.
+    if let Err(e) = verify_macos_codesign(&new_app) {
+        return Err(HostError::Config(format!(
+            "refusing to install: codesign verification failed for {}: {e}",
+            new_app.display()
+        )));
+    }
+
+    swap_app_bundle(&new_app, bundle)?;
+    let mut command = Command::new("xattr");
+    crate::platform::hide_command_window(&mut command);
+    let _ = command
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(bundle)
+        .status();
+    Ok(())
+}
+
+/// Put `new_app` where `bundle` is, whole. Renames on one filesystem, so the
+/// app is never half-written; a failed second rename puts the old one back.
+fn swap_app_bundle(new_app: &Path, bundle: &Path) -> Result<()> {
+    // A first install has nothing to move aside.
+    if !bundle.exists() {
+        return fs::rename(new_app, bundle).map_err(|e| {
+            HostError::Config(format!(
+                "install the new app to {}: {e}",
+                bundle.display()
+            ))
+        });
+    }
+    let backup = with_old_suffix(bundle);
+    let _ = fs::remove_dir_all(&backup);
+    fs::rename(bundle, &backup).map_err(|e| {
+        HostError::Config(format!("move the current app aside ({}): {e}", bundle.display()))
+    })?;
+    if let Err(e) = fs::rename(new_app, bundle) {
+        // Roll back so the user isn't left without a working app.
+        let _ = fs::rename(&backup, bundle);
+        return Err(HostError::Config(format!(
+            "install the new app to {}: {e}",
+            bundle.display()
+        )));
+    }
+    if let Err(e) = fs::remove_dir_all(&backup) {
+        warn!("could not remove the previous app at {}: {e}", backup.display());
+    }
+    Ok(())
+}
+
 fn with_old_suffix(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".old");
@@ -647,6 +838,7 @@ mod tests {
             "https://github.com/yashagldit/PocketShell",
             "v0.1.0",
             "aarch64-apple-darwin",
+            false,
         );
         assert_eq!(archive, "pocketshell-v0.1.0-aarch64-apple-darwin.tar.gz");
         assert_eq!(
@@ -665,6 +857,7 @@ mod tests {
             "https://github.com/yashagldit/PocketShell/",
             "v0.1.0",
             "x86_64-unknown-linux-gnu",
+            false,
         );
         assert_eq!(
             dl,
@@ -697,6 +890,109 @@ mod tests {
             .block_on(check("https://example.test/r", "0.1.0", Some("0.2.0")))
             .unwrap();
         assert!(!info3.up_to_date);
+    }
+
+    #[test]
+    fn an_app_install_fetches_the_app_archive() {
+        let (archive, dl, sha, bundle) = build_urls(
+            "https://github.com/o/r",
+            "v1.4.0",
+            "aarch64-apple-darwin",
+            true,
+        );
+        assert_eq!(archive, "pocketshell-v1.4.0-aarch64-apple-darwin.app.tar.gz");
+        assert_eq!(
+            dl,
+            "https://github.com/o/r/releases/download/v1.4.0/pocketshell-v1.4.0-aarch64-apple-darwin.app.tar.gz"
+        );
+        assert_eq!(sha, format!("{dl}.sha256"));
+        assert_eq!(bundle, format!("{dl}.cosign-bundle.json"));
+    }
+
+    #[test]
+    fn only_a_bundles_main_executable_names_an_app() {
+        assert_eq!(
+            app_bundle_of(Path::new("/Applications/PocketShell.app/Contents/MacOS/pocketshell")),
+            Some(PathBuf::from("/Applications/PocketShell.app"))
+        );
+        for loose in [
+            "/usr/local/bin/pocketshell",
+            "/Users/me/.local/bin/pocketshell",
+            "/Applications/PocketShell.app/Contents/Resources/pocketshell",
+            "/tmp/MacOS/pocketshell",
+            "/opt/thing.app/bin/MacOS/pocketshell",
+        ] {
+            assert_eq!(app_bundle_of(Path::new(loose)), None, "{loose}");
+        }
+    }
+
+    #[test]
+    fn an_app_update_replaces_the_bundle_and_keeps_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("PocketShell.app");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        fs::write(bundle.join("Contents/MacOS/pocketshell"), b"old").unwrap();
+        fs::write(bundle.join("Contents/leftover"), b"stale").unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(staging.join("PocketShell.app/Contents/MacOS")).unwrap();
+        fs::write(staging.join("PocketShell.app/Contents/MacOS/pocketshell"), b"new").unwrap();
+
+        swap_app_bundle(&staging.join("PocketShell.app"), &bundle).unwrap();
+
+        assert_eq!(fs::read(bundle.join("Contents/MacOS/pocketshell")).unwrap(), b"new");
+        assert!(!bundle.join("Contents/leftover").exists(), "replaced whole, not merged");
+        assert!(!with_old_suffix(&bundle).exists(), "no second copy is kept");
+    }
+
+    #[test]
+    fn a_first_app_install_needs_nothing_to_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("Applications/PocketShell.app");
+        fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        let new_app = dir.path().join("staging/PocketShell.app");
+        fs::create_dir_all(new_app.join("Contents/MacOS")).unwrap();
+        fs::write(new_app.join("Contents/MacOS/pocketshell"), b"new").unwrap();
+
+        swap_app_bundle(&new_app, &bundle).unwrap();
+
+        assert_eq!(fs::read(bundle.join("Contents/MacOS/pocketshell")).unwrap(), b"new");
+    }
+
+    /// What moving a loose install into the app leaves at the old path.
+    #[cfg(unix)]
+    #[test]
+    fn a_loose_binary_becomes_a_link_into_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let in_app = dir.path().join("PocketShell.app/Contents/MacOS/pocketshell");
+        fs::create_dir_all(in_app.parent().unwrap()).unwrap();
+        fs::write(&in_app, b"app binary").unwrap();
+        let loose = dir.path().join("bin/pocketshell");
+        fs::create_dir_all(loose.parent().unwrap()).unwrap();
+        fs::write(&loose, b"loose binary").unwrap();
+
+        replace_with_link(&loose, &in_app).unwrap();
+
+        assert_eq!(fs::read_link(&loose).unwrap(), in_app);
+        assert_eq!(fs::read(&loose).unwrap(), b"app binary");
+        let leftovers: Vec<_> = fs::read_dir(loose.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(leftovers, ["pocketshell"], "no second copy, no staging file");
+    }
+
+    #[test]
+    fn an_archive_without_the_app_is_refused_and_the_old_app_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("PocketShell.app");
+        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        fs::write(bundle.join("Contents/MacOS/pocketshell"), b"old").unwrap();
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        assert!(install_app_bundle(&staging, &bundle).is_err());
+        assert_eq!(fs::read(bundle.join("Contents/MacOS/pocketshell")).unwrap(), b"old");
     }
 
     #[test]
