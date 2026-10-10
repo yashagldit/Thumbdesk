@@ -93,7 +93,14 @@ const AUDIT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const AUDIT_MAX_ARCHIVES: usize = 5;
 
 pub fn write_audit_event(mut event: AuditEvent) -> Result<()> {
+    // This crate's own tests exercise code that audits (refused signatures,
+    // sessions that open and close). None of that happened on this machine,
+    // and it must not appear in the log of whoever runs the suite.
+    // A test that means to write points HOME at a temporary directory.
     let paths = AppConfig::paths()?;
+    if cfg!(test) && !paths.state_dir.starts_with(std::env::temp_dir()) {
+        return Ok(());
+    }
     ensure_state_dir(&paths.state_dir)?;
 
     if event.at.is_empty() {
