@@ -194,6 +194,12 @@ pub struct TrustedDeviceRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_public_key: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// The phone's name and OS as the backend knows them, for showing the
+    /// user which device this is. Absent on records from before 1.4.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,6 +846,8 @@ mod tests {
             permissions_json: None,
             device_public_key: None,
             created_at: sample_time(),
+            device_name: None,
+            platform: None,
         };
         let v = serde_json::to_value(&rec).unwrap();
         assert!(v.get("device_public_key").is_none());
