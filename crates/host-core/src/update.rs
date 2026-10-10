@@ -58,7 +58,10 @@ pub struct UpdateInfo {
     /// signature produced by `.github/workflows/release-host-agent.yml`. Empty
     /// for releases predating the cosign rollout.
     pub cosign_bundle_url: String,
-    /// True iff `current_version == target_version` (after stripping leading `v`).
+    /// True when there is nothing to install: this is the target version,
+    /// or, when no version was asked for by name, already newer than the
+    /// latest release (a development build). Asking for a version by name
+    /// installs it whichever way it lies.
     pub up_to_date: bool,
 }
 
@@ -231,6 +234,20 @@ fn normalize(v: &str) -> &str {
     v.trim_start_matches('v')
 }
 
+/// `version` as numbers to compare, when it is plain `major.minor.patch`.
+fn numeric(version: &str) -> Option<Vec<u64>> {
+    normalize(version.trim())
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect()
+}
+
+/// Whether `current` is a later version than `target`. False when either is
+/// not plain numbers, which leaves the decision to equality.
+fn is_newer(current: &str, target: &str) -> bool {
+    matches!((numeric(current), numeric(target)), (Some(current), Some(target)) if current > target)
+}
+
 /// Resolve target version + URLs without downloading anything. Pass
 /// `requested_version=None` to fall back on `<base_url>/releases/latest`.
 pub async fn check(
@@ -238,6 +255,7 @@ pub async fn check(
     current_version: &str,
     requested_version: Option<&str>,
 ) -> Result<UpdateInfo> {
+    let latest = requested_version.is_none_or(|v| v.trim().is_empty());
     let target_version = match requested_version {
         Some(v) if !v.trim().is_empty() => {
             // Accept either `0.1.0` or `v0.1.0`; canonicalize to the tag form
@@ -261,7 +279,8 @@ pub async fn check(
             && app_archive_exists(base_url, &target_version, &target_triple).await);
     let (archive_name, download_url, checksum_url, cosign_bundle_url) =
         build_urls(base_url, &target_version, &target_triple, app);
-    let up_to_date = normalize(&target_version) == normalize(current_version);
+    let up_to_date = normalize(&target_version) == normalize(current_version)
+        || (latest && is_newer(current_version, &target_version));
     Ok(UpdateInfo {
         current_version: current_version.to_string(),
         target_version,
@@ -863,6 +882,25 @@ mod tests {
             dl,
             "https://github.com/yashagldit/PocketShell/releases/download/v0.1.0/pocketshell-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
         );
+    }
+
+    #[test]
+    fn a_build_newer_than_the_release_is_not_behind_it() {
+        assert!(is_newer("1.4.0", "v1.1.0"));
+        assert!(is_newer("1.10.0", "1.9.9"), "compared as numbers, not text");
+        assert!(!is_newer("1.1.0", "v1.1.0"));
+        assert!(!is_newer("1.1.0", "v1.4.0"));
+        assert!(!is_newer("1.4.0-dev", "v1.1.0"), "anything else is left to equality");
+
+        // Asked for by name, an older version is still an install.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let info = rt
+            .block_on(check("https://example.test/r", "1.4.0", Some("1.1.0")))
+            .unwrap();
+        assert!(!info.up_to_date);
     }
 
     #[test]
