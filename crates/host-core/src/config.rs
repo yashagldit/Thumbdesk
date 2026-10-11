@@ -155,7 +155,9 @@ impl AppConfig {
     }
 }
 
-fn resolved_home_dir() -> Option<PathBuf> {
+/// The user's home. Tests redirect it with `POCKETSHELL_TEST_HOME`, because
+/// on Windows `dirs::home_dir()` ignores the environment.
+pub(crate) fn resolved_home_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {
         if let Some(path) = env::var_os("POCKETSHELL_TEST_HOME")

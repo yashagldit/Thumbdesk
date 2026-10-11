@@ -34,14 +34,22 @@ const SERVICE: &str = "pocketshell-host-agent";
 ///
 /// macOS and Windows ship persistent per-user keychains, so the keyring is
 /// safe (and preferred) there.
+///
+/// Unit tests never use it: the service name is the real one, so a test that
+/// saved or cleared a state store would replace or delete this machine's host
+/// key.
 fn use_keyring() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(test)]
+    {
+        return false;
+    }
+    #[cfg(all(not(test), target_os = "linux"))]
     {
         std::env::var_os("POCKETSHELL_USE_KEYRING")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(test), not(target_os = "linux")))]
     {
         true
     }
