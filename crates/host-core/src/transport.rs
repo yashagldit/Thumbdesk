@@ -45,11 +45,23 @@ pub async fn connect_host_ws(
             .map_err(|e| HostError::Backend(format!("invalid auth header: {e}")))?,
     );
 
-    let (socket, _) = connect_async(request)
+    // A peer that accepts the connection and then says nothing (a captive
+    // portal, a wedged proxy) would otherwise hold the daemon here for good:
+    // nothing else in it runs while it connects.
+    let (socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request))
         .await
+        .map_err(|_| {
+            HostError::Backend(format!(
+                "control connection timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            ))
+        })?
         .map_err(|e| HostError::Backend(format!("control connection failed: {e}")))?;
     Ok(socket)
 }
+
+/// How long the TCP connect, TLS and WebSocket upgrade may take together.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub async fn send_signal(ws: &mut WsStream, msg: &SignalEnvelope) -> Result<()> {
     let raw = serde_json::to_string(msg)?;

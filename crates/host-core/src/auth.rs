@@ -60,13 +60,37 @@ pub fn acquire_refresh_lock() -> Result<RefreshLock> {
     Ok(RefreshLock { _file: file })
 }
 
-/// Async-safe lock acquisition. The actual `flock` syscall is blocking, so we
-/// run it on tokio's blocking pool to avoid stalling the runtime if another
-/// process is holding the lock for a long time.
+/// How long [`acquire_refresh_lock_async`] waits for another process to let
+/// go. A refresh is one HTTP call; a holder still there after this is stuck.
+const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Async lock acquisition with a deadline. The daemon awaits this from its
+/// loop, so a process that holds the lock and never releases it (suspended,
+/// or waiting on a keyring prompt) must cost one failed refresh, not the
+/// daemon: it polls a non-blocking attempt and gives up after
+/// [`REFRESH_LOCK_WAIT`].
 pub async fn acquire_refresh_lock_async() -> Result<RefreshLock> {
-    tokio::task::spawn_blocking(acquire_refresh_lock)
-        .await
-        .map_err(|e| HostError::Backend(format!("refresh lock task join error: {e}")))?
+    let path = lock_path()?;
+    let deadline = tokio::time::Instant::now() + REFRESH_LOCK_WAIT;
+    loop {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        match crate::platform::try_lock_exclusive(&file) {
+            Ok(()) => return Ok(RefreshLock { _file: file }),
+            Err(e) if !crate::platform::is_lock_contended(&e) => return Err(HostError::Io(e)),
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                return Err(HostError::Backend(format!(
+                    "another pocketshell process has held the refresh lock for {}s",
+                    REFRESH_LOCK_WAIT.as_secs()
+                )));
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
 }
 
 /// Returns true if the refresh-token JWT's `exp` claim has passed.
