@@ -39,17 +39,16 @@ const SERVICE: &str = "pocketshell-host-agent";
 /// saved or cleared a state store would replace or delete this machine's host
 /// key.
 fn use_keyring() -> bool {
-    #[cfg(test)]
-    {
+    if cfg!(test) {
         return false;
     }
-    #[cfg(all(not(test), target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     {
         std::env::var_os("POCKETSHELL_USE_KEYRING")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     }
-    #[cfg(all(not(test), not(target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         true
     }
