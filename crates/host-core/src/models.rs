@@ -11,6 +11,11 @@ pub struct AgentState {
     pub sessions: Vec<SessionRecord>,
     #[serde(default)]
     pub alert_thresholds: Vec<AlertThreshold>,
+    /// Devices that have spoken the sealed (v2) agent wire to this host:
+    /// mobile device id → the trust binding it spoke under. Not a trust field
+    /// (backend sync never rewrites it); see `daemon::agent_wire` §7.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_v2_devices: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +52,15 @@ pub struct PairAttestation {
 /// Mobile-signed introducer attestation for direct host-to-host transfers.
 /// This binds the transfer id and both host identity keys so the backend can
 /// relay SDP but cannot substitute the verified host public keys.
+///
+/// Version 2 also binds the source path, the destination path and the most
+/// bytes the transfer may carry, so neither the backend nor the source host
+/// chooses what is written where on the destination. The phone sends v2 only
+/// when both hosts run an agent that verifies it (older agents refuse any
+/// version but 1); a v1 attestation from an older app is still accepted, and
+/// its unsigned paths are then the request's, as before.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Default))]
 pub struct HostTransferAttestation {
     pub v: u8,
     pub mobile_device_id: String,
@@ -59,6 +72,39 @@ pub struct HostTransferAttestation {
     pub expires_at: i64,
     pub nonce: String,
     pub sig: String,
+    /// v2: the file read on the source host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src_path: Option<String>,
+    /// v2: the file written on the destination host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dst_path: Option<String>,
+    /// v2: the most bytes the transfer may carry (the source file's size when
+    /// the phone asked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+/// What a v2 [`HostTransferAttestation`] binds beyond the hosts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestedTransferPaths {
+    pub src_path: String,
+    pub dst_path: String,
+    pub size: u64,
+}
+
+impl HostTransferAttestation {
+    /// The signed paths and size of a verified v2 attestation; None for v1,
+    /// whose path fields (if any) are not covered by its signature.
+    pub fn attested_paths(&self) -> Option<AttestedTransferPaths> {
+        if self.v < 2 {
+            return None;
+        }
+        Some(AttestedTransferPaths {
+            src_path: self.src_path.clone()?,
+            dst_path: self.dst_path.clone()?,
+            size: self.size?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

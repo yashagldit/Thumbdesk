@@ -20,7 +20,6 @@ use crate::error::{HostError, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -452,8 +451,7 @@ pub async fn download_and_install_with(
     }
 
     info!("extracting {}", info.archive_name);
-    let mut command = Command::new("tar");
-    crate::platform::hide_command_window(&mut command);
+    let mut command = crate::platform::host_command("tar");
     let status = command
         .arg("-xzf")
         .arg(&archive_path)
@@ -466,7 +464,7 @@ pub async fn download_and_install_with(
     }
 
     if let Some(bundle) = app_bundle {
-        install_app_bundle(&staging, &bundle)?;
+        install_app_bundle(&staging, &bundle).await?;
         info!(
             "installed PocketShell.app {} → {}",
             info.target_version,
@@ -515,6 +513,7 @@ pub async fn download_and_install_with(
             new_binary.display()
         )));
     }
+    ensure_new_binary_runs(&new_binary, &staging).await?;
 
     // Atomically replace the on-disk binary. On Linux/macOS, `rename` over
     // a running executable is safe: the kernel keeps the old inode alive
@@ -552,8 +551,7 @@ pub async fn download_and_install_with(
     // Strip it so the next exec doesn't get blocked by Gatekeeper, mirroring
     // the same step in install.sh. Best-effort.
     if cfg!(target_os = "macos") {
-        let mut command = Command::new("xattr");
-        crate::platform::hide_command_window(&mut command);
+        let mut command = crate::platform::host_command("xattr");
         let _ = command
             .args(["-d", "com.apple.quarantine"])
             .arg(&current_exe)
@@ -577,7 +575,7 @@ pub async fn download_and_install_with(
 /// into `staging`. The running process keeps its already-mapped files, as
 /// with a renamed-over binary. No copy of the old app is kept: the app is the
 /// only copy of the agent on a Mac, and a second one would outlive it.
-fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<()> {
+async fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<()> {
     let new_app = staging.join("PocketShell.app");
     if !new_app.join("Contents/MacOS/pocketshell").exists() {
         return Err(HostError::Config(
@@ -592,10 +590,10 @@ fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<()> {
             new_app.display()
         )));
     }
+    ensure_new_binary_runs(&new_app.join("Contents/MacOS/pocketshell"), staging).await?;
 
     swap_app_bundle(&new_app, bundle)?;
-    let mut command = Command::new("xattr");
-    crate::platform::hide_command_window(&mut command);
+    let mut command = crate::platform::host_command("xattr");
     let _ = command
         .args(["-dr", "com.apple.quarantine"])
         .arg(bundle)
@@ -634,6 +632,66 @@ fn swap_app_bundle(new_app: &Path, bundle: &Path) -> Result<()> {
     Ok(())
 }
 
+/// How long the staged binary gets to answer `--version`. The first exec of
+/// a fresh macOS binary waits on its signature check, which can take seconds.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Refuse an update whose binary cannot start on this machine, before it
+/// replaces the one that can. dyld refuses a binary built for a newer macOS
+/// (or missing a system library) before any of our code runs, so once such a
+/// binary is swapped in the service crash-loops and the host never comes back
+/// to take another update. Runs off the async workers: the probe can wait the
+/// whole [`PROBE_TIMEOUT`].
+async fn ensure_new_binary_runs(binary: &Path, staging: &Path) -> Result<()> {
+    let (binary, staging) = (binary.to_path_buf(), staging.to_path_buf());
+    tokio::task::spawn_blocking(move || probe_binary(&binary, &staging, PROBE_TIMEOUT))
+        .await
+        .map_err(|e| HostError::Config(format!("refusing to install: probe task failed: {e}")))?
+}
+
+/// Run `<binary> --version` and require it to exit 0 within `timeout`.
+fn probe_binary(binary: &Path, staging: &Path, timeout: Duration) -> Result<()> {
+    let log_path = staging.join("probe.log");
+    let log = fs::File::create(&log_path)
+        .map_err(|e| HostError::Config(format!("create probe log: {e}")))?;
+    let log_err = log
+        .try_clone()
+        .map_err(|e| HostError::Config(format!("create probe log: {e}")))?;
+    let mut command = crate::platform::host_command(binary);
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(log_err);
+    let status = crate::service::run_with_timeout(&mut command, timeout).map_err(|e| {
+        HostError::Config(if e.kind() == std::io::ErrorKind::TimedOut {
+            format!(
+                "refusing to install: the new binary did not answer --version within {timeout:?}"
+            )
+        } else {
+            format!("refusing to install: the new binary cannot be started: {e}")
+        })
+    })?;
+    if status.success() {
+        return Ok(());
+    }
+    let output = fs::read_to_string(&log_path).unwrap_or_default();
+    let output = output.trim();
+    let likely = if cfg!(target_os = "macos") {
+        " — it may need a newer macOS than this Mac runs"
+    } else {
+        ""
+    };
+    Err(HostError::Config(format!(
+        "refusing to install: the new binary does not run on this machine ({status}){likely}{}",
+        if output.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", output.chars().take(500).collect::<String>())
+        }
+    )))
+}
+
 fn with_old_suffix(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".old");
@@ -670,8 +728,7 @@ const COSIGN_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 /// auto-install cosign — silently fetching another binary to verify this
 /// binary expands the trust surface in a non-obvious way.
 fn cosign_available() -> bool {
-    let mut command = Command::new("cosign");
-    crate::platform::hide_command_window(&mut command);
+    let mut command = crate::platform::host_command("cosign");
     command
         .arg("version")
         .stdout(std::process::Stdio::null())
@@ -687,8 +744,7 @@ fn cosign_available() -> bool {
 /// archived 2026-05-18). When sigstore-rs stabilizes, replace this with an
 /// in-process verifier and a baked-in TUF trust root.
 fn verify_cosign_bundle(artifact: &Path, bundle: &Path) -> Result<()> {
-    let mut command = Command::new("cosign");
-    crate::platform::hide_command_window(&mut command);
+    let mut command = crate::platform::host_command("cosign");
     let output = command
         .args(["verify-blob", "--new-bundle-format", "--bundle"])
         .arg(bundle)
@@ -748,8 +804,7 @@ fn verify_macos_codesign(binary: &Path) -> Result<()> {
     // verify form requires the equals-sign syntax `-R=<requirement>` as a
     // single argv entry. Easy to get wrong — see `man codesign`.
     let req_arg = format!("-R={}", developer_id_requirement(EXPECTED_APPLE_TEAM_ID));
-    let mut command = Command::new("codesign");
-    crate::platform::hide_command_window(&mut command);
+    let mut command = crate::platform::host_command("codesign");
     let output = command
         .args(["--verify", "--strict"])
         .arg(&req_arg)
@@ -1020,8 +1075,8 @@ mod tests {
         assert_eq!(leftovers, ["pocketshell"], "no second copy, no staging file");
     }
 
-    #[test]
-    fn an_archive_without_the_app_is_refused_and_the_old_app_stays() {
+    #[tokio::test]
+    async fn an_archive_without_the_app_is_refused_and_the_old_app_stays() {
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("PocketShell.app");
         fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
@@ -1029,8 +1084,62 @@ mod tests {
         let staging = dir.path().join("staging");
         fs::create_dir_all(&staging).unwrap();
 
-        assert!(install_app_bundle(&staging, &bundle).is_err());
+        assert!(install_app_bundle(&staging, &bundle).await.is_err());
         assert_eq!(fs::read(bundle.join("Contents/MacOS/pocketshell")).unwrap(), b"old");
+    }
+
+    #[cfg(unix)]
+    fn fake_binary(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("pocketshell");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_answers_version_passes_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(dir.path(), r#"[ "$1" = --version ] && echo "pocketshell 9.9.9""#);
+        probe_binary(&bin, dir.path(), Duration::from_secs(10)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_cannot_load_is_refused_with_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(
+            dir.path(),
+            "echo 'dyld: Library not loaded: ScreenCaptureKit' >&2; exit 134",
+        );
+        let err = probe_binary(&bin, dir.path(), Duration::from_secs(10))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refusing to install"), "{err}");
+        assert!(err.contains("Library not loaded"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_that_hangs_is_refused_after_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(dir.path(), "sleep 30");
+        let started = std::time::Instant::now();
+        let err = probe_binary(&bin, dir.path(), Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not answer"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_binary_that_is_missing_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = probe_binary(&dir.path().join("nope"), dir.path(), Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be started"), "{err}");
     }
 
     #[test]

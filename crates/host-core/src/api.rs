@@ -85,6 +85,8 @@ struct ErrorPolicy {
     host_gone_on_403: bool,
     /// 404 -> `HostError::HostGone` (host row no longer exists).
     host_gone_on_404: bool,
+    /// 402 -> `HostError::QuotaExhausted` (a metered allowance is spent).
+    quota_on_402: bool,
     detail: Detail,
 }
 
@@ -95,6 +97,7 @@ impl ErrorPolicy {
             revoked_on_401: false,
             host_gone_on_403: false,
             host_gone_on_404: false,
+            quota_on_402: false,
             detail: Detail::Body,
         }
     }
@@ -119,6 +122,11 @@ impl ErrorPolicy {
 
     fn host_gone_on_404(mut self) -> Self {
         self.host_gone_on_404 = true;
+        self
+    }
+
+    fn quota_on_402(mut self) -> Self {
+        self.quota_on_402 = true;
         self
     }
 }
@@ -156,13 +164,17 @@ impl BackendClient {
             return Ok(res);
         }
 
-        Err(HostError::Backend(match policy.detail {
+        let detail = match policy.detail {
             Detail::Body => {
                 let body = res.text().await.unwrap_or_default();
                 format!("{ctx}: {body}")
             }
             Detail::Status => format!("{ctx}: {status}"),
-        }))
+        };
+        if policy.quota_on_402 && status == StatusCode::PAYMENT_REQUIRED {
+            return Err(HostError::QuotaExhausted(detail));
+        }
+        Err(HostError::Backend(detail))
     }
 
     /// Decode a JSON body. `ctx` is the noun in `"invalid <ctx>: <err>"`,
@@ -581,11 +593,12 @@ impl BackendClient {
         // unavailable": every offer then fails, sessions degrade silently to
         // the backend WS relay (laggy, and with no badge to say so), and the
         // daemon never tries to re-authenticate because nothing told it the
-        // token was the problem.
+        // token was the problem. A 402 is the spent monthly quota, which the
+        // TURN cache backs off from for longer.
         let res = Self::check(
             res,
             "turn credentials request failed",
-            ErrorPolicy::body().revoked_on_401(),
+            ErrorPolicy::body().revoked_on_401().quota_on_402(),
         )
         .await?;
 
@@ -1251,6 +1264,22 @@ mod tests {
         match err {
             HostError::Backend(m) => assert!(m.contains("nope")),
             other => panic!("expected Backend got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_credentials_402_is_quota_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/webrtc/turn-credentials"))
+            .respond_with(ResponseTemplate::new(402).set_body_string("quota spent"))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let err = c.turn_credentials("tk").await.unwrap_err();
+        match err {
+            HostError::QuotaExhausted(m) => assert!(m.contains("quota spent")),
+            other => panic!("expected QuotaExhausted got {other:?}"),
         }
     }
 
