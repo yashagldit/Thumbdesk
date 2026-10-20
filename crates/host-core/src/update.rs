@@ -11,8 +11,10 @@
 //! `PocketShell.app/Contents/MacOS/pocketshell`. Agents already in the field
 //! update from exactly that and nothing else: they look the binary up by that
 //! name and rename it over themselves, so it must stay a file, not a link.
-//! Unix archives also carry `thumbdesk` as a link to it, which old agents
-//! never look at.
+//! Nothing else goes in the plain archives: an old agent extracts all of it,
+//! and one entry its `tar` cannot create (a link, on a staging dir that holds
+//! none) fails the whole update. The other name is added on the host instead
+//! (`command_alias`).
 //!
 //! Asset layout (standard GitHub Releases):
 //!
@@ -569,10 +571,11 @@ pub async fn download_and_install_with(
     Ok(current_exe)
 }
 
-/// The binary an extracted archive holds: `thumbdesk` when it is a file of
-/// its own, otherwise `pocketshell`, the name every release so far carries
-/// it under (with `thumbdesk` as a link to it, which is skipped: renamed over
-/// the running binary, a link would point into the deleted staging dir).
+/// The binary an extracted archive holds: `thumbdesk` should a future
+/// archive carry it as a file of its own, otherwise `pocketshell`, the name
+/// every release so far carries it under. A link under either name is
+/// skipped: renamed over the running binary, it would point into the deleted
+/// staging dir.
 fn extracted_binary(staging: &Path) -> Option<PathBuf> {
     crate::command_alias::COMMAND_NAMES
         .iter()
@@ -1178,7 +1181,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_thumbdesk_link_is_passed_over_for_the_file_it_names() {
-        // The layout every release carries: renaming the link over the
+        // No release carries one, but should one: renaming the link over the
         // running binary would leave it pointing into the staging dir.
         let dir = tempfile::tempdir().unwrap();
         file(&dir.path().join("pocketshell"), b"binary");
@@ -1201,10 +1204,10 @@ mod tests {
         assert_eq!(extracted_binary(dir.path()), None);
     }
 
-    /// The archive the release workflow packs (`pocketshell` as a file,
-    /// `thumbdesk` a link to it), extracted with the same `tar -xzf` the
-    /// updater runs, reads right both to an old agent, which takes
-    /// `pocketshell` by name, and to this one.
+    /// The archive the release workflow packs (one entry, `pocketshell`, a
+    /// regular file), extracted with the same `tar -xzf` the updater runs,
+    /// reads right both to an old agent, which takes `pocketshell` by name,
+    /// and to this one.
     #[cfg(unix)]
     #[test]
     fn the_release_archive_layout_suits_old_and_new_agents() {
@@ -1212,14 +1215,13 @@ mod tests {
         let pack = dir.path().join("pack");
         fs::create_dir_all(&pack).unwrap();
         file(&pack.join("pocketshell"), b"binary");
-        std::os::unix::fs::symlink("pocketshell", pack.join("thumbdesk")).unwrap();
         let archive = dir.path().join("pocketshell-v9.9.9-test.tar.gz");
         let packed = std::process::Command::new("tar")
             .arg("-czf")
             .arg(&archive)
             .arg("-C")
             .arg(&pack)
-            .args(["pocketshell", "thumbdesk"])
+            .arg("pocketshell")
             .status()
             .unwrap();
         assert!(packed.success());
@@ -1235,11 +1237,12 @@ mod tests {
             .unwrap();
         assert!(unpacked.success());
 
-        // What an old agent checks and renames into place: a regular file.
+        // What an old agent checks and renames into place: a regular file,
+        // and nothing beside it.
         let old_pick = staging.join("pocketshell");
         assert!(old_pick.symlink_metadata().unwrap().is_file());
         assert_eq!(extracted_binary(&staging), Some(old_pick));
-        assert!(staging.join("thumbdesk").symlink_metadata().unwrap().is_symlink());
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
     }
 
     #[test]
