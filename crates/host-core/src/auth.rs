@@ -84,7 +84,7 @@ pub async fn acquire_refresh_lock_async() -> Result<RefreshLock> {
             Err(e) if !crate::platform::is_lock_contended(&e) => return Err(HostError::Io(e)),
             Err(_) if tokio::time::Instant::now() >= deadline => {
                 return Err(HostError::Backend(format!(
-                    "another pocketshell process has held the refresh lock for {}s",
+                    "another thumbdesk process has held the refresh lock for {}s",
                     REFRESH_LOCK_WAIT.as_secs()
                 )));
             }

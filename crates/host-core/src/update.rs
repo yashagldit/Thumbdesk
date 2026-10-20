@@ -1,9 +1,18 @@
 //! Self-update for the host agent.
 //!
-//! Downloads the matching pre-built `pocketshell` binary from GitHub
-//! Releases, verifies its SHA-256, and atomically replaces the on-disk
-//! binary. Mirrors `website/public/install.sh` so users get the same
-//! release artifacts whether they install fresh or upgrade.
+//! Downloads the matching pre-built binary from GitHub Releases, verifies its
+//! SHA-256, and atomically replaces the on-disk binary. Mirrors
+//! `website/public/install.sh` so users get the same release artifacts
+//! whether they install fresh or upgrade.
+//!
+//! The CLI is now `thumbdesk`, but the archives keep their `pocketshell`
+//! names and still hold the real binary as a regular file called
+//! `pocketshell` (`pocketshell.exe`) at their root, and the app archive
+//! `PocketShell.app/Contents/MacOS/pocketshell`. Agents already in the field
+//! update from exactly that and nothing else: they look the binary up by that
+//! name and rename it over themselves, so it must stay a file, not a link.
+//! Unix archives also carry `thumbdesk` as a link to it, which old agents
+//! never look at.
 //!
 //! Asset layout (standard GitHub Releases):
 //!
@@ -471,6 +480,7 @@ pub async fn download_and_install_with(
             bundle.display()
         );
         if !converting {
+            crate::command_alias::ensure_aliases_for(&current_exe);
             return Ok(current_exe);
         }
         // The app is in place and is now the only copy: the old binary's
@@ -483,22 +493,13 @@ pub async fn download_and_install_with(
             "{} is now a link into PocketShell.app",
             current_exe.display()
         );
+        crate::command_alias::ensure_aliases_for(&binary);
         return Ok(binary);
     }
 
-    // The release tarball carries `pocketshell.exe` on Windows, `pocketshell`
-    // everywhere else — matching the binary name cargo produces per target.
-    let bin_name = if cfg!(windows) {
-        "pocketshell.exe"
-    } else {
-        "pocketshell"
-    };
-    let new_binary = staging.join(bin_name);
-    if !new_binary.exists() {
-        return Err(HostError::Config(format!(
-            "tarball did not contain a `{bin_name}` binary"
-        )));
-    }
+    let new_binary = extracted_binary(&staging).ok_or_else(|| {
+        HostError::Config("archive did not contain a `thumbdesk` or `pocketshell` binary".into())
+    })?;
 
     // On macOS, verify the new binary carries our Developer ID code signature
     // before we swap it in. The SHA-256 above only proves the bytes match what
@@ -559,12 +560,30 @@ pub async fn download_and_install_with(
     }
 
     info!(
-        "installed pocketshell {} → {}",
+        "installed thumbdesk {} → {}",
         info.target_version,
         current_exe.display()
     );
     info!("previous binary saved at {}", backup_path.display());
+    crate::command_alias::ensure_aliases_for(&current_exe);
     Ok(current_exe)
+}
+
+/// The binary an extracted archive holds: `thumbdesk` when it is a file of
+/// its own, otherwise `pocketshell`, the name every release so far carries
+/// it under (with `thumbdesk` as a link to it, which is skipped: renamed over
+/// the running binary, a link would point into the deleted staging dir).
+fn extracted_binary(staging: &Path) -> Option<PathBuf> {
+    crate::command_alias::COMMAND_NAMES
+        .iter()
+        .map(|name| {
+            staging.join(if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.to_string()
+            })
+        })
+        .find(|path| path.symlink_metadata().is_ok_and(|meta| meta.is_file()))
 }
 
 /// `current_exe.with_extension("old")` would mangle `pocketshell` into
@@ -1140,6 +1159,87 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot be started"), "{err}");
+    }
+
+    #[cfg(unix)]
+    fn file(path: &Path, body: &[u8]) {
+        fs::write(path, body).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_extracted_binary_is_thumbdesk_when_it_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        file(&dir.path().join("pocketshell"), b"old name");
+        file(&dir.path().join("thumbdesk"), b"new name");
+        assert_eq!(extracted_binary(dir.path()), Some(dir.path().join("thumbdesk")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_thumbdesk_link_is_passed_over_for_the_file_it_names() {
+        // The layout every release carries: renaming the link over the
+        // running binary would leave it pointing into the staging dir.
+        let dir = tempfile::tempdir().unwrap();
+        file(&dir.path().join("pocketshell"), b"binary");
+        std::os::unix::fs::symlink("pocketshell", dir.path().join("thumbdesk")).unwrap();
+        assert_eq!(extracted_binary(dir.path()), Some(dir.path().join("pocketshell")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_from_before_the_rename_still_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        file(&dir.path().join("pocketshell"), b"binary");
+        assert_eq!(extracted_binary(dir.path()), Some(dir.path().join("pocketshell")));
+    }
+
+    #[test]
+    fn an_archive_without_either_binary_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("README"), b"no binary").unwrap();
+        assert_eq!(extracted_binary(dir.path()), None);
+    }
+
+    /// The archive the release workflow packs (`pocketshell` as a file,
+    /// `thumbdesk` a link to it), extracted with the same `tar -xzf` the
+    /// updater runs, reads right both to an old agent, which takes
+    /// `pocketshell` by name, and to this one.
+    #[cfg(unix)]
+    #[test]
+    fn the_release_archive_layout_suits_old_and_new_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("pack");
+        fs::create_dir_all(&pack).unwrap();
+        file(&pack.join("pocketshell"), b"binary");
+        std::os::unix::fs::symlink("pocketshell", pack.join("thumbdesk")).unwrap();
+        let archive = dir.path().join("pocketshell-v9.9.9-test.tar.gz");
+        let packed = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&pack)
+            .args(["pocketshell", "thumbdesk"])
+            .status()
+            .unwrap();
+        assert!(packed.success());
+
+        let staging = dir.path().join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let unpacked = std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&staging)
+            .status()
+            .unwrap();
+        assert!(unpacked.success());
+
+        // What an old agent checks and renames into place: a regular file.
+        let old_pick = staging.join("pocketshell");
+        assert!(old_pick.symlink_metadata().unwrap().is_file());
+        assert_eq!(extracted_binary(&staging), Some(old_pick));
+        assert!(staging.join("thumbdesk").symlink_metadata().unwrap().is_symlink());
     }
 
     #[test]
