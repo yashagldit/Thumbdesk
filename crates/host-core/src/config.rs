@@ -1,5 +1,4 @@
 use crate::error::{HostError, Result};
-use std::env;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -30,66 +29,43 @@ pub struct AppPaths {
 impl AppConfig {
     pub fn from_env() -> Self {
         // Backend URLs are not hardcoded in source. Production binaries bake
-        // them in at compile time via the POCKETSHELL_DEFAULT_BACKEND_URL /
-        // POCKETSHELL_DEFAULT_WS_URL env vars (see option_env! below). Builds
-        // from source without those compile-time env vars will start with
-        // empty defaults, and must supply POCKETSHELL_BACKEND_URL /
-        // POCKETSHELL_WS_URL at runtime.
-        let backend_base_url = env::var("POCKETSHELL_BACKEND_URL")
-            .ok()
+        // them in at compile time via the THUMBDESK_DEFAULT_BACKEND_URL /
+        // THUMBDESK_DEFAULT_WS_URL env vars (see option_env! below; the
+        // POCKETSHELL_DEFAULT_* names from before the rename still work, so
+        // a build script or CI secret not yet renamed bakes the same URLs).
+        // Builds from source without them start with empty defaults, and
+        // must supply THUMBDESK_BACKEND_URL / THUMBDESK_WS_URL at runtime.
+        // Every runtime variable here is also read under its POCKETSHELL_
+        // name (`brand::EnvVar`).
+        let backend_base_url = crate::env_var!("BACKEND_URL")
+            .get()
             .filter(|s| !s.is_empty())
-            .or_else(|| option_env!("POCKETSHELL_DEFAULT_BACKEND_URL").map(str::to_string))
+            .or_else(|| default_backend_url().map(str::to_string))
             .unwrap_or_default();
-        let ws_url = env::var("POCKETSHELL_WS_URL")
-            .ok()
+        let ws_url = crate::env_var!("WS_URL")
+            .get()
             .filter(|s| !s.is_empty())
-            .or_else(|| option_env!("POCKETSHELL_DEFAULT_WS_URL").map(str::to_string))
+            .or_else(|| default_ws_url().map(str::to_string))
             .unwrap_or_default();
-        let app_version = env::var("POCKETSHELL_APP_VERSION")
-            .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
-        let min_backend_host_version = env::var("POCKETSHELL_MIN_HOST_VERSION").ok();
+        let app_version = crate::env_var!("APP_VERSION")
+            .get()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        let min_backend_host_version = crate::env_var!("MIN_HOST_VERSION").get();
 
-        let heartbeat_interval_secs = env::var("POCKETSHELL_HEARTBEAT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20);
-
-        let stats_interval_secs = env::var("POCKETSHELL_STATS_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5);
-
-        let summary_interval_secs = env::var("POCKETSHELL_SUMMARY_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(15);
-
-        let session_limit = env::var("POCKETSHELL_SESSION_LIMIT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(20);
-
-        let stale_session_secs = env::var("POCKETSHELL_STALE_SESSION_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(300);
-
-        let detach_max_secs = env::var("POCKETSHELL_DETACH_MAX_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(86400); // 24 hours default
-
-        let alert_check_interval_secs = env::var("POCKETSHELL_ALERT_CHECK_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(60);
+        let heartbeat_interval_secs = crate::env_var!("HEARTBEAT_SECS").parse().unwrap_or(20);
+        let stats_interval_secs = crate::env_var!("STATS_SECS").parse().unwrap_or(5);
+        let summary_interval_secs = crate::env_var!("SUMMARY_SECS").parse().unwrap_or(15);
+        let session_limit = crate::env_var!("SESSION_LIMIT").parse().unwrap_or(20);
+        let stale_session_secs = crate::env_var!("STALE_SESSION_SECS").parse().unwrap_or(300);
+        // 24 hours default
+        let detach_max_secs = crate::env_var!("DETACH_MAX_SECS").parse().unwrap_or(86400);
+        let alert_check_interval_secs = crate::env_var!("ALERT_CHECK_SECS").parse().unwrap_or(60);
 
         // Trust sync used to fire every 30s — at 2K hosts that was 66 req/s
         // of redundant lookups. 5 min is plenty for revocations to propagate;
         // mobile-driven approval flows take seconds, not minutes, anyway.
-        let trusted_devices_interval_secs = env::var("POCKETSHELL_TRUSTED_DEVICES_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+        let trusted_devices_interval_secs = crate::env_var!("TRUSTED_DEVICES_SECS")
+            .parse()
             .unwrap_or(300);
 
         Self {
@@ -112,7 +88,9 @@ impl AppConfig {
         let home = resolved_home_dir()
             .ok_or_else(|| HostError::Config("unable to resolve home directory".to_string()))?;
 
-        let state_dir = home.join(".pocketshell");
+        // `~/.thumbdesk`, or `~/.pocketshell` until an install from before
+        // the rename has been moved (`state_dir`).
+        let state_dir = crate::state_dir::state_dir_in(&home);
         let state_file = state_dir.join("state.json");
         let pid_file = state_dir.join("daemon.pid");
         let log_file = state_dir.join("daemon.log");
@@ -129,7 +107,7 @@ impl AppConfig {
 
     pub fn default_shell() -> String {
         // Explicit override wins on every platform.
-        if let Ok(s) = std::env::var("POCKETSHELL_SHELL") {
+        if let Some(s) = crate::env_var!("SHELL").get() {
             if !s.is_empty() {
                 return s;
             }
@@ -139,7 +117,7 @@ impl AppConfig {
         {
             // PowerShell ships on all supported Windows versions and gives a
             // far better remote-terminal experience than cmd.exe. `cmd.exe`
-            // remains reachable via POCKETSHELL_SHELL for users who prefer it.
+            // remains reachable via THUMBDESK_SHELL for users who prefer it.
             "powershell.exe".to_string()
         }
         #[cfg(not(windows))]
@@ -155,12 +133,29 @@ impl AppConfig {
     }
 }
 
-/// The user's home. Tests redirect it with `POCKETSHELL_TEST_HOME`, because
-/// on Windows `dirs::home_dir()` ignores the environment.
+/// The compile-time backend URL, under its new or its old build variable.
+fn default_backend_url() -> Option<&'static str> {
+    option_env!("THUMBDESK_DEFAULT_BACKEND_URL")
+        .filter(|s| !s.is_empty())
+        .or(option_env!("THUMBDESK_DEFAULT_BACKEND_URL"))
+}
+
+/// The compile-time host WebSocket URL, under its new or its old build
+/// variable.
+fn default_ws_url() -> Option<&'static str> {
+    option_env!("THUMBDESK_DEFAULT_WS_URL")
+        .filter(|s| !s.is_empty())
+        .or(option_env!("THUMBDESK_DEFAULT_WS_URL"))
+}
+
+/// The user's home. Tests redirect it with `THUMBDESK_TEST_HOME` (or
+/// `POCKETSHELL_TEST_HOME`), because on Windows `dirs::home_dir()` ignores
+/// the environment.
 pub(crate) fn resolved_home_dir() -> Option<PathBuf> {
     #[cfg(test)]
     {
-        if let Some(path) = env::var_os("POCKETSHELL_TEST_HOME")
+        if let Some(path) = crate::env_var!("TEST_HOME")
+            .get_os()
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
         {
@@ -176,28 +171,34 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::test_support::HOME_LOCK as ENV_LOCK;
+    #[cfg(unix)]
+    use std::env;
 
     #[cfg(unix)]
     const ALL_VARS: &[&str] = &[
-        "POCKETSHELL_BACKEND_URL",
-        "POCKETSHELL_WS_URL",
-        "POCKETSHELL_APP_VERSION",
-        "POCKETSHELL_MIN_HOST_VERSION",
-        "POCKETSHELL_HEARTBEAT_SECS",
-        "POCKETSHELL_STATS_SECS",
-        "POCKETSHELL_SUMMARY_SECS",
-        "POCKETSHELL_SESSION_LIMIT",
-        "POCKETSHELL_STALE_SESSION_SECS",
-        "POCKETSHELL_DETACH_MAX_SECS",
-        "POCKETSHELL_ALERT_CHECK_SECS",
-        "POCKETSHELL_TRUSTED_DEVICES_SECS",
+        "THUMBDESK_BACKEND_URL",
+        "THUMBDESK_WS_URL",
+        "THUMBDESK_APP_VERSION",
+        "THUMBDESK_MIN_HOST_VERSION",
+        "THUMBDESK_HEARTBEAT_SECS",
+        "THUMBDESK_STATS_SECS",
+        "THUMBDESK_SUMMARY_SECS",
+        "THUMBDESK_SESSION_LIMIT",
+        "THUMBDESK_STALE_SESSION_SECS",
+        "THUMBDESK_DETACH_MAX_SECS",
+        "THUMBDESK_ALERT_CHECK_SECS",
+        "THUMBDESK_TRUSTED_DEVICES_SECS",
     ];
 
     #[cfg(unix)]
     fn clear_all() {
         for v in ALL_VARS {
+            let legacy = v.replacen("THUMBDESK_", "POCKETSHELL_", 1);
             // SAFETY: tests serialize via ENV_LOCK.
-            unsafe { env::remove_var(v) };
+            unsafe {
+                env::remove_var(v);
+                env::remove_var(legacy);
+            }
         }
     }
 
@@ -229,18 +230,18 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("POCKETSHELL_BACKEND_URL", "https://example.test");
-            env::set_var("POCKETSHELL_WS_URL", "wss://example.test/ws");
-            env::set_var("POCKETSHELL_APP_VERSION", "9.9.9");
-            env::set_var("POCKETSHELL_MIN_HOST_VERSION", "1.2.3");
-            env::set_var("POCKETSHELL_HEARTBEAT_SECS", "7");
-            env::set_var("POCKETSHELL_STATS_SECS", "11");
-            env::set_var("POCKETSHELL_SUMMARY_SECS", "23");
-            env::set_var("POCKETSHELL_SESSION_LIMIT", "42");
-            env::set_var("POCKETSHELL_STALE_SESSION_SECS", "600");
-            env::set_var("POCKETSHELL_DETACH_MAX_SECS", "100");
-            env::set_var("POCKETSHELL_ALERT_CHECK_SECS", "30");
-            env::set_var("POCKETSHELL_TRUSTED_DEVICES_SECS", "120");
+            env::set_var("THUMBDESK_BACKEND_URL", "https://example.test");
+            env::set_var("THUMBDESK_WS_URL", "wss://example.test/ws");
+            env::set_var("THUMBDESK_APP_VERSION", "9.9.9");
+            env::set_var("THUMBDESK_MIN_HOST_VERSION", "1.2.3");
+            env::set_var("THUMBDESK_HEARTBEAT_SECS", "7");
+            env::set_var("THUMBDESK_STATS_SECS", "11");
+            env::set_var("THUMBDESK_SUMMARY_SECS", "23");
+            env::set_var("THUMBDESK_SESSION_LIMIT", "42");
+            env::set_var("THUMBDESK_STALE_SESSION_SECS", "600");
+            env::set_var("THUMBDESK_DETACH_MAX_SECS", "100");
+            env::set_var("THUMBDESK_ALERT_CHECK_SECS", "30");
+            env::set_var("THUMBDESK_TRUSTED_DEVICES_SECS", "120");
         }
         let cfg = AppConfig::from_env();
         assert_eq!(cfg.backend_base_url, "https://example.test");
@@ -260,12 +261,30 @@ mod tests {
 
     #[cfg(unix)] // POSIX-only behavior; not meaningful on Windows
     #[test]
+    fn from_env_reads_the_names_from_before_the_rename() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_all();
+        unsafe {
+            env::set_var("POCKETSHELL_BACKEND_URL", "https://old.example.test");
+            env::set_var("POCKETSHELL_HEARTBEAT_SECS", "9");
+            env::set_var("POCKETSHELL_STATS_SECS", "13");
+            env::set_var("THUMBDESK_STATS_SECS", "14");
+        }
+        let cfg = AppConfig::from_env();
+        assert_eq!(cfg.backend_base_url, "https://old.example.test");
+        assert_eq!(cfg.heartbeat_interval_secs, 9);
+        assert_eq!(cfg.stats_interval_secs, 14, "the new name wins");
+        clear_all();
+    }
+
+    #[cfg(unix)] // POSIX-only behavior; not meaningful on Windows
+    #[test]
     fn from_env_invalid_numeric_falls_back_to_default() {
         let _g = ENV_LOCK.lock().unwrap();
         clear_all();
         unsafe {
-            env::set_var("POCKETSHELL_HEARTBEAT_SECS", "not-a-number");
-            env::set_var("POCKETSHELL_SESSION_LIMIT", "-5"); // invalid for usize
+            env::set_var("THUMBDESK_HEARTBEAT_SECS", "not-a-number");
+            env::set_var("THUMBDESK_SESSION_LIMIT", "-5"); // invalid for usize
         }
         let cfg = AppConfig::from_env();
         assert_eq!(cfg.heartbeat_interval_secs, 20);
@@ -283,22 +302,28 @@ mod tests {
         unsafe { env::set_var("HOME", tmp.path()) };
 
         let paths = AppConfig::paths().expect("paths should resolve");
-        assert_eq!(paths.state_dir, tmp.path().join(".pocketshell"));
+        assert_eq!(paths.state_dir, tmp.path().join(".thumbdesk"));
+        // An install from before the rename that has not been moved yet is
+        // still found where it is.
+        std::fs::create_dir(tmp.path().join(".pocketshell")).unwrap();
+        let unmoved = AppConfig::paths().expect("paths should resolve");
+        assert_eq!(unmoved.state_dir, tmp.path().join(".pocketshell"));
+        std::fs::remove_dir(tmp.path().join(".pocketshell")).unwrap();
         assert_eq!(
             paths.state_file,
-            tmp.path().join(".pocketshell").join("state.json")
+            tmp.path().join(".thumbdesk").join("state.json")
         );
         assert_eq!(
             paths.pid_file,
-            tmp.path().join(".pocketshell").join("daemon.pid")
+            tmp.path().join(".thumbdesk").join("daemon.pid")
         );
         assert_eq!(
             paths.log_file,
-            tmp.path().join(".pocketshell").join("daemon.log")
+            tmp.path().join(".thumbdesk").join("daemon.log")
         );
         assert_eq!(
             paths.audit_file,
-            tmp.path().join(".pocketshell").join("audit.log")
+            tmp.path().join(".thumbdesk").join("audit.log")
         );
 
         // restore

@@ -376,7 +376,7 @@ mod tests {
         }
 
         result.expect("write_audit_event should succeed");
-        let audit_path = tmp.path().join(".pocketshell").join("audit.log");
+        let audit_path = tmp.path().join(".thumbdesk").join("audit.log");
         let contents = std::fs::read_to_string(&audit_path).expect("audit file exists");
         assert!(contents.ends_with('\n'));
         let line = contents.trim_end();
@@ -404,11 +404,11 @@ mod tests {
         }
         result.expect("write_audit_event should succeed");
 
-        let audit_path = tmp.path().join(".pocketshell").join("audit.log");
+        let audit_path = tmp.path().join(".thumbdesk").join("audit.log");
         let mode = std::fs::metadata(&audit_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "audit.log must be 0o600, got {:o}", mode);
 
-        let dir_mode = std::fs::metadata(tmp.path().join(".pocketshell"))
+        let dir_mode = std::fs::metadata(tmp.path().join(".thumbdesk"))
             .unwrap()
             .permissions()
             .mode()
@@ -432,7 +432,7 @@ mod tests {
 
         // Pre-seed an audit.log over the 5MB threshold to force rotation on
         // the next append.
-        let state_dir = tmp.path().join(".pocketshell");
+        let state_dir = tmp.path().join(".thumbdesk");
         std::fs::create_dir_all(&state_dir).unwrap();
         let audit_path = state_dir.join("audit.log");
         // Just over 5 MB.

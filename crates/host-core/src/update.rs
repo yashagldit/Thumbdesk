@@ -5,16 +5,24 @@
 //! `website/public/install.sh` so users get the same release artifacts
 //! whether they install fresh or upgrade.
 //!
-//! The CLI is now `thumbdesk`, but the archives keep their `pocketshell`
-//! names and still hold the real binary as a regular file called
-//! `pocketshell` (`pocketshell.exe`) at their root, and the app archive
-//! `PocketShell.app/Contents/MacOS/pocketshell`. Agents already in the field
-//! update from exactly that and nothing else: they look the binary up by that
-//! name and rename it over themselves, so it must stay a file, not a link.
-//! Nothing else goes in the plain archives: an old agent extracts all of it,
-//! and one entry its `tar` cannot create (a link, on a staging dir that holds
-//! none) fails the whole update. The other name is added on the host instead
-//! (`command_alias`).
+//! The CLI is now `thumbdesk`, but the plain archives keep their
+//! `pocketshell` names and still hold the real binary as a regular file
+//! called `pocketshell` (`pocketshell.exe`) at their root. Agents already in
+//! the field (every release up to v1.1.0) update from exactly that and
+//! nothing else: they look the binary up by that name and rename it over
+//! themselves, so it must stay a file, not a link. Nothing else goes in the
+//! plain archives: an old agent extracts all of it, and one entry its `tar`
+//! cannot create (a link, on a staging dir that holds none) fails the whole
+//! update. The other name is added on the host instead (`command_alias`).
+//!
+//! The macOS app archive (`….app.tar.gz`) is newer than every released
+//! agent: no agent in the field reads it. It holds `Thumbdesk.app`, whose
+//! executable is `Contents/MacOS/thumbdesk`. An app archive from before the
+//! rename (`PocketShell.app/Contents/MacOS/pocketshell`, development builds
+//! only) is still accepted, and either way the app is installed as
+//! `Thumbdesk.app`; an install found under the old folder name is moved
+//! (see [`download_and_install_with`]). The bundle identifier stays
+//! `pocketshell`, which is what macOS ties the agent's permissions to.
 //!
 //! Asset layout (standard GitHub Releases):
 //!
@@ -25,7 +33,7 @@
 //! ```
 //!
 //! `<base_url>` is the GitHub repo URL — forks/mirrors can point
-//! `POCKETSHELL_BASE_URL` at their own repo and the same logic works.
+//! `--base-url` at their own repo and the same logic works.
 
 use crate::error::{HostError, Result};
 use sha2::{Digest, Sha256};
@@ -35,8 +43,17 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 /// Default release host. The public host-agent repo on GitHub — assets are
-/// served as standard release downloads, no auth required.
+/// served as standard release downloads, no auth required. Keeps its old
+/// name: every released agent updates from this repository, and the release
+/// signatures are pinned to it (`COSIGN_IDENTITY_REGEXP`).
 pub const DEFAULT_BASE_URL: &str = "https://github.com/yashagldit/PocketShell";
+
+/// The macOS app's folder name.
+pub const APP_BUNDLE_NAME: &str = "Thumbdesk.app";
+
+/// The app's folder name before the rename: still accepted in an archive, and
+/// moved to [`APP_BUNDLE_NAME`] where an install has it.
+pub const LEGACY_APP_BUNDLE_NAME: &str = "PocketShell.app";
 
 /// Apple Team ID stamped on every released macOS binary by the codesign step
 /// in `.github/workflows/release-host-agent.yml`. Not a secret — visible via
@@ -58,7 +75,8 @@ pub struct UpdateInfo {
     pub target_version: String,
     /// Triple like `aarch64-apple-darwin` — must match the release artifact suffix.
     pub target_triple: String,
-    /// `pocketshell-vX.Y.Z-<triple>.tar.gz`
+    /// `pocketshell-vX.Y.Z-<triple>.tar.gz` (the release asset names keep
+    /// their old prefix: released agents fetch exactly these)
     pub archive_name: String,
     /// Direct URL to the tarball on GitHub releases.
     pub download_url: String,
@@ -145,7 +163,8 @@ pub async fn resolve_latest_tag(base_url: &str) -> Result<String> {
 }
 
 /// `app` selects the macOS app archive (`….app.tar.gz`, a whole
-/// `PocketShell.app`) over the plain binary's.
+/// `Thumbdesk.app`) over the plain binary's. The `pocketshell-` prefix is the
+/// release contract every released agent fetches by.
 fn build_urls(
     base_url: &str,
     tag: &str,
@@ -162,7 +181,7 @@ fn build_urls(
 }
 
 /// The app bundle `exe` is the main executable of, if it is one:
-/// `/Applications/PocketShell.app` for `…/PocketShell.app/Contents/MacOS/pocketshell`.
+/// `/Applications/Thumbdesk.app` for `…/Thumbdesk.app/Contents/MacOS/thumbdesk`.
 fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
     let macos = exe.parent()?;
     let contents = macos.parent()?;
@@ -173,7 +192,7 @@ fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
     is_bundle.then(|| bundle.to_path_buf())
 }
 
-/// Whether this process is the agent inside PocketShell.app. Such an install
+/// Whether this process is the agent inside Thumbdesk.app. Such an install
 /// updates by replacing the whole app: swapping only the binary would leave
 /// a bundle whose signature no longer matches its contents, and macOS would
 /// treat it as a different, unpermitted program.
@@ -201,7 +220,7 @@ async fn app_archive_exists(base_url: &str, tag: &str, target: &str) -> bool {
         .is_ok_and(|response| response.status().is_success())
 }
 
-/// Where a first PocketShell.app goes: `/Applications`, or the user's own
+/// Where a first Thumbdesk.app goes: `/Applications`, or the user's own
 /// `~/Applications` when that is not writable.
 fn app_install_dir() -> Result<PathBuf> {
     let mut candidates = vec![PathBuf::from("/Applications")];
@@ -209,14 +228,14 @@ fn app_install_dir() -> Result<PathBuf> {
         candidates.push(home.join("Applications"));
     }
     for dir in candidates {
-        let probe = dir.join(format!(".pocketshell-probe-{}", std::process::id()));
+        let probe = dir.join(format!(".thumbdesk-probe-{}", std::process::id()));
         if fs::create_dir_all(&probe).is_ok() {
             let _ = fs::remove_dir(&probe);
             return Ok(dir);
         }
     }
     Err(HostError::Config(
-        "no writable Applications folder to install PocketShell.app into".into(),
+        "no writable Applications folder to install Thumbdesk.app into".into(),
     ))
 }
 
@@ -280,7 +299,7 @@ pub async fn check(
         _ => resolve_latest_tag(base_url).await?,
     };
     let target_triple = detect_target()?;
-    // On a Mac the agent lives in PocketShell.app. An install already there
+    // On a Mac the agent lives in Thumbdesk.app. An install already there
     // takes the app archive; a loose binary takes it too, and moves into the
     // app, when the release has one. Releases from before the app existed do
     // not, and update the binary in place as they always did.
@@ -378,21 +397,28 @@ pub async fn download_and_install_with(
     // An app archive replaces the bundle, so it is staged beside the bundle;
     // a binary archive beside the binary. A loose binary handed an app
     // archive is moving into the app: the app is installed fresh and the
-    // binary's path becomes a link to it.
+    // binary's path becomes a link to it. An app under its folder name from
+    // before the rename is moving too: Thumbdesk.app goes in beside it.
     let is_app_archive = info.archive_name.ends_with(".app.tar.gz");
-    let converting = is_app_archive && app_bundle_of(&current_exe).is_none();
-    let app_bundle = match (is_app_archive, app_bundle_of(&current_exe)) {
+    let current_bundle = app_bundle_of(&current_exe);
+    let converting = is_app_archive && current_bundle.is_none();
+    let app_bundle = match (is_app_archive, &current_bundle) {
         (false, _) => None,
-        (true, Some(bundle)) => Some(bundle),
-        (true, None) => Some(app_install_dir()?.join("PocketShell.app")),
+        (true, Some(bundle)) => Some(renamed_bundle(bundle)),
+        (true, None) => Some(app_install_dir()?.join(APP_BUNDLE_NAME)),
     };
+    let renaming = current_bundle
+        .as_ref()
+        .zip(app_bundle.as_ref())
+        .filter(|(current, target)| current != target)
+        .map(|(current, _)| current.clone());
     let install_dir = app_bundle
         .as_deref()
         .unwrap_or(&current_exe)
         .parent()
         .ok_or_else(|| HostError::Config("current exe has no parent dir".into()))?
         .to_path_buf();
-    let staging = install_dir.join(format!(".pocketshell-update-{}", std::process::id()));
+    let staging = install_dir.join(format!(".thumbdesk-update-{}", std::process::id()));
     fs::create_dir_all(&staging).map_err(|e| {
         HostError::Config(format!(
             "create staging dir {} (need write access to install dir): {e}",
@@ -475,27 +501,29 @@ pub async fn download_and_install_with(
     }
 
     if let Some(bundle) = app_bundle {
-        install_app_bundle(&staging, &bundle).await?;
+        let binary = install_app_bundle(&staging, &bundle).await?;
         info!(
-            "installed PocketShell.app {} → {}",
+            "installed {APP_BUNDLE_NAME} {} → {}",
             info.target_version,
             bundle.display()
         );
-        if !converting {
-            crate::command_alias::ensure_aliases_for(&current_exe);
-            return Ok(current_exe);
+        if converting {
+            // The app is in place and is now the only copy: the old binary's
+            // path becomes a link into it, so the command and the running
+            // service both lead there.
+            replace_with_link(&current_exe, &binary)?;
+            crate::service::repoint_launchd(&current_exe, &binary);
+            info!("{} is now a link into {APP_BUNDLE_NAME}", current_exe.display());
+            crate::command_alias::ensure_aliases_for(&binary);
+            return Ok(binary);
         }
-        // The app is in place and is now the only copy: the old binary's
-        // path becomes a link into it, so the command and the running
-        // service both lead there.
-        let binary = bundle.join("Contents/MacOS/pocketshell");
-        replace_with_link(&current_exe, &binary)?;
-        crate::service::repoint_launchd(&current_exe, &binary);
-        info!(
-            "{} is now a link into PocketShell.app",
-            current_exe.display()
-        );
-        crate::command_alias::ensure_aliases_for(&binary);
+        // The app moved (PocketShell.app to Thumbdesk.app), or its executable
+        // has another name than before (`pocketshell` to `thumbdesk`).
+        if let (Some(old_bundle), true) = (&current_bundle, renaming.is_some() || binary != current_exe) {
+            finish_bundle_move(old_bundle, renaming.is_some(), &current_exe, &binary);
+        } else {
+            crate::command_alias::ensure_aliases_for(&binary);
+        }
         return Ok(binary);
     }
 
@@ -531,7 +559,7 @@ pub async fn download_and_install_with(
     })?;
 
     if let Err(e) = fs::rename(&new_binary, &current_exe) {
-        // Roll back so the user isn't left without a working `pocketshell`.
+        // Roll back so the user isn't left without a working `thumbdesk`.
         let _ = fs::rename(&backup_path, &current_exe);
         return Err(HostError::Config(format!(
             "install new binary to {}: {e}",
@@ -589,21 +617,46 @@ fn extracted_binary(staging: &Path) -> Option<PathBuf> {
         .find(|path| path.symlink_metadata().is_ok_and(|meta| meta.is_file()))
 }
 
-/// `current_exe.with_extension("old")` would mangle `pocketshell` into
-/// `pocketshell.old` (correct), but on Windows-style paths with extensions
-/// it would replace the extension. Keep both: `pocketshell` → `pocketshell.old`,
-/// `pocketshell.exe` → `pocketshell.exe.old`.
-/// Replace the installed app `bundle` with the `PocketShell.app` extracted
-/// into `staging`. The running process keeps its already-mapped files, as
-/// with a renamed-over binary. No copy of the old app is kept: the app is the
-/// only copy of the agent on a Mac, and a second one would outlive it.
-async fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<()> {
-    let new_app = staging.join("PocketShell.app");
-    if !new_app.join("Contents/MacOS/pocketshell").exists() {
-        return Err(HostError::Config(
-            "archive did not contain PocketShell.app".into(),
-        ));
+/// Where an app at `bundle` is installed by an update: the same folder, as
+/// `Thumbdesk.app` (which it already is, unless it is an install from before
+/// the rename). An app inside an npm package keeps its place: the package's
+/// launcher looks it up there by name.
+fn renamed_bundle(bundle: &Path) -> PathBuf {
+    if bundle.components().any(|part| part.as_os_str() == "node_modules") {
+        return bundle.to_path_buf();
     }
+    bundle.with_file_name(APP_BUNDLE_NAME)
+}
+
+/// The agent executable inside `bundle`: `Contents/MacOS/thumbdesk`, or
+/// `pocketshell` in an app built before the rename.
+pub fn bundle_executable(bundle: &Path) -> Option<PathBuf> {
+    crate::command_alias::COMMAND_NAMES
+        .iter()
+        .map(|name| bundle.join("Contents/MacOS").join(name))
+        .find(|path| path.is_file())
+}
+
+/// The app an extracted archive holds: `Thumbdesk.app`, or `PocketShell.app`
+/// from an archive made before the rename, with its executable.
+fn extracted_app(staging: &Path) -> Option<(PathBuf, PathBuf)> {
+    [APP_BUNDLE_NAME, LEGACY_APP_BUNDLE_NAME]
+        .iter()
+        .map(|name| staging.join(name))
+        .find_map(|app| bundle_executable(&app).map(|exe| (app, exe)))
+}
+
+/// Replace the installed app `bundle` with the app extracted into `staging`,
+/// and return the executable it now holds. The running process keeps its
+/// already-mapped files, as with a renamed-over binary. No copy of the old
+/// app is kept: the app is the only copy of the agent on a Mac, and a second
+/// one would outlive it.
+async fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<PathBuf> {
+    let Some((new_app, new_exe)) = extracted_app(staging) else {
+        return Err(HostError::Config(format!(
+            "archive did not contain {APP_BUNDLE_NAME}"
+        )));
+    };
     // The same authenticity check the binary gets, on the bundle as a whole:
     // codesign validates every file in it against the signature.
     if let Err(e) = verify_macos_codesign(&new_app) {
@@ -612,7 +665,11 @@ async fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<()> {
             new_app.display()
         )));
     }
-    ensure_new_binary_runs(&new_app.join("Contents/MacOS/pocketshell"), staging).await?;
+    ensure_new_binary_runs(&new_exe, staging).await?;
+    let relative = new_exe
+        .strip_prefix(&new_app)
+        .map_err(|_| HostError::Config("app executable outside its bundle".into()))?
+        .to_path_buf();
 
     swap_app_bundle(&new_app, bundle)?;
     let mut command = crate::platform::host_command("xattr");
@@ -620,7 +677,153 @@ async fn install_app_bundle(staging: &Path, bundle: &Path) -> Result<()> {
         .args(["-dr", "com.apple.quarantine"])
         .arg(bundle)
         .status();
-    Ok(())
+    Ok(bundle.join(relative))
+}
+
+/// After an update installed the app at `new_exe` where `old_exe`, inside
+/// `old_bundle`, ran before (an app from before the rename, `PocketShell.app`
+/// or an executable called `pocketshell`): point what led to the old path at
+/// the new one, and with `remove_old`, remove the old app (a bundle beside
+/// the new one), so the new app is again the only copy. The LaunchAgent is
+/// rewritten, the commands on the PATH that led into the old app are
+/// relinked, and the restart that follows the update loads the service again
+/// from the new path (`service::restart`).
+fn finish_bundle_move(old_bundle: &Path, remove_old: bool, old_exe: &Path, new_exe: &Path) {
+    crate::service::repoint_launchd(old_exe, new_exe);
+    #[cfg(unix)]
+    for dir in crate::command_alias::command_dirs() {
+        for name in crate::command_alias::COMMAND_NAMES {
+            let link = dir.join(name);
+            let into_old = fs::read_link(&link)
+                .is_ok_and(|target| target.starts_with(old_bundle) && target != new_exe);
+            if into_old {
+                if let Err(e) = replace_with_link(&link, new_exe) {
+                    warn!("could not relink {}: {e}", link.display());
+                }
+            }
+        }
+    }
+    crate::command_alias::ensure_aliases_for(new_exe);
+    if !remove_old {
+        return;
+    }
+    match fs::remove_dir_all(old_bundle) {
+        Ok(()) => info!(
+            "moved the app from {} to {}",
+            old_bundle.display(),
+            new_exe.display()
+        ),
+        Err(e) => warn!("could not remove the old app at {}: {e}", old_bundle.display()),
+    }
+}
+
+/// Remove a `PocketShell.app` left beside the running `Thumbdesk.app`.
+///
+/// `install.sh` installs the app under the archive's folder name, so a Mac
+/// that had the app from before the rename ends up with both; only an update
+/// run by the agent itself moves one to the other. The service code calls
+/// this once it has installed or restarted the service for an agent running
+/// from a `Thumbdesk.app` ([`crate::service`]), which is also when the
+/// daemon under the old LaunchAgent label has just been replaced.
+///
+/// A candidate (in `/Applications` or `~/Applications`) goes only when it is
+/// a real folder, not a link and not inside an npm package, its bundle
+/// identifier is `pocketshell` (ours, not some other app of that name), it is
+/// not the app this process runs from, and nothing runs from it any more
+/// (the daemon it ran is given a moment to finish exiting). Commands on the
+/// PATH that led into it are pointed at this app first, and a LaunchAgent
+/// naming it is rewritten, as after an update that moved the app.
+pub fn remove_leftover_legacy_app() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe().and_then(fs::canonicalize) else {
+        return;
+    };
+    let Some(current) = app_bundle_of(&exe) else {
+        return;
+    };
+    if current.file_name().is_none_or(|name| name != APP_BUNDLE_NAME) || in_npm_package(&current) {
+        return;
+    }
+    let mut dirs = vec![PathBuf::from("/Applications")];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    for old in leftover_legacy_apps(&current, &dirs) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runs_from(&old) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if runs_from(&old) {
+            info!("leaving {}: a process still runs from it", old.display());
+            continue;
+        }
+        let old_exe = bundle_executable(&old).unwrap_or_else(|| old.join("Contents/MacOS/pocketshell"));
+        finish_bundle_move(&old, true, &old_exe, &exe);
+    }
+}
+
+/// The `PocketShell.app` bundles in `dirs` that [`remove_leftover_legacy_app`]
+/// may remove for an agent running from `current`: real folders, ours by
+/// bundle identifier, not `current` itself, not in an npm package.
+fn leftover_legacy_apps(current: &Path, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let current = fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    dirs.iter()
+        .map(|dir| dir.join(LEGACY_APP_BUNDLE_NAME))
+        .filter(|old| old.symlink_metadata().is_ok_and(|meta| meta.file_type().is_dir()))
+        .filter(|old| !in_npm_package(old))
+        .filter(|old| fs::canonicalize(old).is_ok_and(|real| real != current))
+        .filter(|old| bundle_identifier(old).as_deref() == Some(OUR_BUNDLE_ID))
+        .collect()
+}
+
+/// The bundle identifier the app has always had, from before the rename.
+const OUR_BUNDLE_ID: &str = "pocketshell";
+
+fn in_npm_package(path: &Path) -> bool {
+    path.components().any(|part| part.as_os_str() == "node_modules")
+}
+
+/// `CFBundleIdentifier` from `bundle`'s Info.plist. Read as XML, which is how
+/// `build-macos-app.sh` writes it; a binary plist is asked of `plutil`.
+fn bundle_identifier(bundle: &Path) -> Option<String> {
+    let plist = bundle.join("Contents/Info.plist");
+    let bytes = fs::read(&plist).ok()?;
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if let Some(rest) = text.split("<key>CFBundleIdentifier</key>").nth(1) {
+            let value = rest.trim_start().strip_prefix("<string>")?;
+            return value.split("</string>").next().map(|id| id.trim().to_string());
+        }
+        if text.trim_start().starts_with("<?xml") {
+            return None;
+        }
+    }
+    let output = crate::platform::host_command("plutil")
+        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"])
+        .arg(&plist)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Whether any process runs an executable inside `bundle`.
+fn runs_from(bundle: &Path) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    let bundle = fs::canonicalize(bundle).unwrap_or_else(|_| bundle.to_path_buf());
+    system
+        .processes()
+        .values()
+        .any(|process| process.exe().is_some_and(|exe| exe.starts_with(&bundle)))
 }
 
 /// Put `new_app` where `bundle` is, whole. Renames on one filesystem, so the
@@ -714,6 +917,10 @@ fn probe_binary(binary: &Path, staging: &Path, timeout: Duration) -> Result<()> 
     )))
 }
 
+/// `current_exe.with_extension("old")` would mangle `thumbdesk` into
+/// `thumbdesk.old` (correct), but on Windows-style paths with extensions
+/// it would replace the extension. Keep both: `thumbdesk` → `thumbdesk.old`,
+/// `thumbdesk.exe` → `thumbdesk.exe.old`.
 fn with_old_suffix(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".old");
@@ -1027,34 +1234,97 @@ mod tests {
     #[test]
     fn only_a_bundles_main_executable_names_an_app() {
         assert_eq!(
+            app_bundle_of(Path::new("/Applications/Thumbdesk.app/Contents/MacOS/thumbdesk")),
+            Some(PathBuf::from("/Applications/Thumbdesk.app"))
+        );
+        assert_eq!(
             app_bundle_of(Path::new("/Applications/PocketShell.app/Contents/MacOS/pocketshell")),
             Some(PathBuf::from("/Applications/PocketShell.app"))
         );
         for loose in [
-            "/usr/local/bin/pocketshell",
+            "/usr/local/bin/thumbdesk",
             "/Users/me/.local/bin/pocketshell",
-            "/Applications/PocketShell.app/Contents/Resources/pocketshell",
-            "/tmp/MacOS/pocketshell",
-            "/opt/thing.app/bin/MacOS/pocketshell",
+            "/Applications/Thumbdesk.app/Contents/Resources/thumbdesk",
+            "/tmp/MacOS/thumbdesk",
+            "/opt/thing.app/bin/MacOS/thumbdesk",
         ] {
             assert_eq!(app_bundle_of(Path::new(loose)), None, "{loose}");
         }
     }
 
+    fn fake_app(dir: &Path, folder: &str, exe: &str, body: &[u8]) -> PathBuf {
+        let app = dir.join(folder);
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/MacOS").join(exe), body).unwrap();
+        app
+    }
+
+    #[test]
+    fn an_archive_with_either_app_layout_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = fake_app(&dir.path().join("new"), "Thumbdesk.app", "thumbdesk", b"new");
+        assert_eq!(
+            extracted_app(&dir.path().join("new")),
+            Some((current.clone(), current.join("Contents/MacOS/thumbdesk")))
+        );
+        // An app archive from before the rename.
+        let legacy = fake_app(&dir.path().join("old"), "PocketShell.app", "pocketshell", b"old");
+        assert_eq!(
+            extracted_app(&dir.path().join("old")),
+            Some((legacy.clone(), legacy.join("Contents/MacOS/pocketshell")))
+        );
+        // A folder with no executable in it is no app.
+        fs::create_dir_all(dir.path().join("empty/Thumbdesk.app/Contents/MacOS")).unwrap();
+        assert_eq!(extracted_app(&dir.path().join("empty")), None);
+    }
+
+    #[test]
+    fn an_app_from_before_the_rename_is_installed_as_thumbdesk_app() {
+        assert_eq!(
+            renamed_bundle(Path::new("/Applications/PocketShell.app")),
+            PathBuf::from("/Applications/Thumbdesk.app")
+        );
+        assert_eq!(
+            renamed_bundle(Path::new("/Users/me/Applications/Thumbdesk.app")),
+            PathBuf::from("/Users/me/Applications/Thumbdesk.app")
+        );
+        let npm = Path::new("/opt/lib/node_modules/@pocketshell/darwin-arm64/PocketShell.app");
+        assert_eq!(renamed_bundle(npm), npm);
+    }
+
+    #[tokio::test]
+    async fn an_old_layout_archive_lands_as_thumbdesk_app() {
+        // codesign is a no-op off macOS and refuses unsigned fakes on it.
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let old_app = fake_app(&staging, "PocketShell.app", "pocketshell", b"#!/bin/sh\nexit 0\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exe = old_app.join("Contents/MacOS/pocketshell");
+            fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bundle = dir.path().join("Applications/Thumbdesk.app");
+        fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        let exe = install_app_bundle(&staging, &bundle).await.unwrap();
+        assert_eq!(exe, bundle.join("Contents/MacOS/pocketshell"));
+        assert!(exe.is_file());
+    }
+
     #[test]
     fn an_app_update_replaces_the_bundle_and_keeps_no_copy() {
         let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path().join("PocketShell.app");
-        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
-        fs::write(bundle.join("Contents/MacOS/pocketshell"), b"old").unwrap();
+        let bundle = fake_app(dir.path(), "Thumbdesk.app", "thumbdesk", b"old");
         fs::write(bundle.join("Contents/leftover"), b"stale").unwrap();
         let staging = dir.path().join("staging");
-        fs::create_dir_all(staging.join("PocketShell.app/Contents/MacOS")).unwrap();
-        fs::write(staging.join("PocketShell.app/Contents/MacOS/pocketshell"), b"new").unwrap();
+        let new_app = fake_app(&staging, "Thumbdesk.app", "thumbdesk", b"new");
 
-        swap_app_bundle(&staging.join("PocketShell.app"), &bundle).unwrap();
+        swap_app_bundle(&new_app, &bundle).unwrap();
 
-        assert_eq!(fs::read(bundle.join("Contents/MacOS/pocketshell")).unwrap(), b"new");
+        assert_eq!(fs::read(bundle.join("Contents/MacOS/thumbdesk")).unwrap(), b"new");
         assert!(!bundle.join("Contents/leftover").exists(), "replaced whole, not merged");
         assert!(!with_old_suffix(&bundle).exists(), "no second copy is kept");
     }
@@ -1062,15 +1332,146 @@ mod tests {
     #[test]
     fn a_first_app_install_needs_nothing_to_replace() {
         let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path().join("Applications/PocketShell.app");
+        let bundle = dir.path().join("Applications/Thumbdesk.app");
         fs::create_dir_all(bundle.parent().unwrap()).unwrap();
-        let new_app = dir.path().join("staging/PocketShell.app");
-        fs::create_dir_all(new_app.join("Contents/MacOS")).unwrap();
-        fs::write(new_app.join("Contents/MacOS/pocketshell"), b"new").unwrap();
+        let new_app = fake_app(&dir.path().join("staging"), "Thumbdesk.app", "thumbdesk", b"new");
 
         swap_app_bundle(&new_app, &bundle).unwrap();
 
-        assert_eq!(fs::read(bundle.join("Contents/MacOS/pocketshell")).unwrap(), b"new");
+        assert_eq!(fs::read(bundle.join("Contents/MacOS/thumbdesk")).unwrap(), b"new");
+    }
+
+    /// An update from an app under its old name: the new app goes in beside
+    /// it, the commands that led into the old one lead into the new one, and
+    /// the old one is gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_app_leaves_no_copy_and_no_link_into_the_old_one() {
+        let _g = crate::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let old_app = fake_app(dir.path(), "PocketShell.app", "pocketshell", b"old");
+        let old_exe = old_app.join("Contents/MacOS/pocketshell");
+        let new_app = fake_app(dir.path(), "Thumbdesk.app", "thumbdesk", b"new");
+        let new_exe = new_app.join("Contents/MacOS/thumbdesk");
+        let home = dir.path().join("home");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(&old_exe, bin.join("pocketshell")).unwrap();
+        std::os::unix::fs::symlink(&old_exe, bin.join("thumbdesk")).unwrap();
+        let prev_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+
+        finish_bundle_move(&old_app, true, &old_exe, &new_exe);
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert!(!old_app.exists());
+        assert_eq!(fs::read_link(bin.join("thumbdesk")).unwrap(), new_exe);
+        assert_eq!(fs::read_link(bin.join("pocketshell")).unwrap(), new_exe);
+        assert_eq!(fs::read(bin.join("pocketshell")).unwrap(), b"new");
+    }
+
+    fn info_plist(app: &Path, bundle_id: &str) {
+        fs::write(
+            app.join("Contents/Info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n  \
+                 <key>CFBundleName</key>\n  <string>Thumbdesk</string>\n  \
+                 <key>CFBundleIdentifier</key>\n  <string>{bundle_id}</string>\n</dict>\n</plist>\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_bundle_identifier_is_read_from_the_xml_plist() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = fake_app(dir.path(), "PocketShell.app", "pocketshell", b"old");
+        info_plist(&app, "pocketshell");
+        assert_eq!(bundle_identifier(&app).as_deref(), Some("pocketshell"));
+        info_plist(&app, "com.example.other");
+        assert_eq!(bundle_identifier(&app).as_deref(), Some("com.example.other"));
+        assert_eq!(bundle_identifier(&dir.path().join("missing.app")), None);
+    }
+
+    /// Only our own `PocketShell.app`, as a real folder, other than the app
+    /// running, outside npm, is a leftover to remove.
+    #[cfg(unix)]
+    #[test]
+    fn only_our_own_old_app_beside_the_new_one_is_a_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("Applications");
+        let user_apps = dir.path().join("home/Applications");
+        let current = fake_app(&apps, "Thumbdesk.app", "thumbdesk", b"new");
+        let ours = fake_app(&apps, "PocketShell.app", "pocketshell", b"old");
+        info_plist(&ours, "pocketshell");
+        // Someone else's app that happens to have the name.
+        let theirs = fake_app(&user_apps, "PocketShell.app", "pocketshell", b"other");
+        info_plist(&theirs, "com.example.pocketshell");
+
+        let found = leftover_legacy_apps(&current, &[apps.clone(), user_apps.clone()]);
+        assert_eq!(found, [apps.join("PocketShell.app")]);
+
+        // A link (to the new app, say) is not a folder to remove.
+        fs::remove_dir_all(&ours).unwrap();
+        std::os::unix::fs::symlink(&current, apps.join("PocketShell.app")).unwrap();
+        assert!(leftover_legacy_apps(&current, &[apps.clone()]).is_empty());
+
+        // The app running is never its own leftover.
+        let running_old = fake_app(&user_apps.join("x"), "PocketShell.app", "pocketshell", b"o");
+        info_plist(&running_old, "pocketshell");
+        assert!(leftover_legacy_apps(&running_old, &[user_apps.join("x")]).is_empty());
+
+        // Nor one inside an npm package.
+        let npm = dir.path().join("lib/node_modules/@pocketshell/darwin-arm64");
+        let npm_app = fake_app(&npm, "PocketShell.app", "pocketshell", b"npm");
+        info_plist(&npm_app, "pocketshell");
+        assert!(leftover_legacy_apps(&current, &[npm]).is_empty());
+    }
+
+    /// Removing a leftover relinks the commands that led into it, as an
+    /// update that moved the app does.
+    #[cfg(unix)]
+    #[test]
+    fn a_removed_leftover_leaves_the_commands_leading_to_the_new_app() {
+        let _g = crate::test_support::HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("Applications");
+        let current = fake_app(&apps, "Thumbdesk.app", "thumbdesk", b"new");
+        let new_exe = current.join("Contents/MacOS/thumbdesk");
+        let old = fake_app(&apps, "PocketShell.app", "pocketshell", b"old");
+        info_plist(&old, "pocketshell");
+        let home = dir.path().join("home");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(old.join("Contents/MacOS/pocketshell"), bin.join("pocketshell")).unwrap();
+        let prev_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", &home) };
+
+        for leftover in leftover_legacy_apps(&current, &[apps.clone()]) {
+            assert!(!runs_from(&leftover));
+            let old_exe = bundle_executable(&leftover).unwrap();
+            finish_bundle_move(&leftover, true, &old_exe, &new_exe);
+        }
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        assert!(!old.exists());
+        assert!(current.exists());
+        assert_eq!(fs::read_link(bin.join("pocketshell")).unwrap(), new_exe);
+    }
+
+    #[test]
+    fn a_bundle_this_process_runs_from_is_in_use() {
+        let exe = std::env::current_exe().unwrap();
+        // The test binary's own directory stands in for a bundle.
+        assert!(runs_from(&fs::canonicalize(exe.parent().unwrap()).unwrap()));
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!runs_from(dir.path()));
     }
 
     /// What moving a loose install into the app leaves at the old path.
@@ -1078,7 +1479,7 @@ mod tests {
     #[test]
     fn a_loose_binary_becomes_a_link_into_the_app() {
         let dir = tempfile::tempdir().unwrap();
-        let in_app = dir.path().join("PocketShell.app/Contents/MacOS/pocketshell");
+        let in_app = dir.path().join("Thumbdesk.app/Contents/MacOS/thumbdesk");
         fs::create_dir_all(in_app.parent().unwrap()).unwrap();
         fs::write(&in_app, b"app binary").unwrap();
         let loose = dir.path().join("bin/pocketshell");
@@ -1100,14 +1501,12 @@ mod tests {
     #[tokio::test]
     async fn an_archive_without_the_app_is_refused_and_the_old_app_stays() {
         let dir = tempfile::tempdir().unwrap();
-        let bundle = dir.path().join("PocketShell.app");
-        fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
-        fs::write(bundle.join("Contents/MacOS/pocketshell"), b"old").unwrap();
+        let bundle = fake_app(dir.path(), "Thumbdesk.app", "thumbdesk", b"old");
         let staging = dir.path().join("staging");
         fs::create_dir_all(&staging).unwrap();
 
         assert!(install_app_bundle(&staging, &bundle).await.is_err());
-        assert_eq!(fs::read(bundle.join("Contents/MacOS/pocketshell")).unwrap(), b"old");
+        assert_eq!(fs::read(bundle.join("Contents/MacOS/thumbdesk")).unwrap(), b"old");
     }
 
     #[cfg(unix)]
@@ -1123,7 +1522,7 @@ mod tests {
     #[test]
     fn a_binary_that_answers_version_passes_the_probe() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_binary(dir.path(), r#"[ "$1" = --version ] && echo "pocketshell 9.9.9""#);
+        let bin = fake_binary(dir.path(), r#"[ "$1" = --version ] && echo "thumbdesk 9.9.9""#);
         probe_binary(&bin, dir.path(), Duration::from_secs(10)).unwrap();
     }
 
@@ -1272,7 +1671,7 @@ mod tests {
     #[test]
     fn verify_macos_codesign_is_noop_on_non_macos() {
         // Off-platform the verify must short-circuit so Linux/Windows builds
-        // of `pocketshell update` don't try to spawn a non-existent `codesign`.
+        // of `thumbdesk update` don't try to spawn a non-existent `codesign`.
         // We can't assert codesign behavior portably on macOS in unit tests
         // because it depends on a properly-signed binary at the given path.
         #[cfg(not(target_os = "macos"))]

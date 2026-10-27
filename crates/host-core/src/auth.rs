@@ -1,7 +1,7 @@
 //! Cross-process safe token refresh.
 //!
 //! The host agent runs as a long-lived daemon, but short-lived CLI commands
-//! (e.g. `pocketshell pair-qr`) also touch the same `state.json` and can
+//! (e.g. `thumbdesk pair-qr`) also touch the same `state.json` and can
 //! issue refresh requests. Without coordination two processes can both load
 //! the same refresh token and fire `/token/refresh` concurrently — the first
 //! wins, the server marks the JTI `used` in Redis, and the loser is now
@@ -264,7 +264,7 @@ async fn reauth_with_signing_key(
 
 /// The pure network+crypto half of the signing-key reauth. Split out from
 /// [`reauth_with_signing_key`] so it can be tested without disk / keyring
-/// access — those tests would otherwise clobber the real `pocketshell`
+/// access — those tests would otherwise clobber the real `thumbdesk`
 /// keychain entry when run on a developer's machine.
 ///
 /// Signed payload uses an RFC 3339 timestamp with seconds precision and an
@@ -376,7 +376,7 @@ mod tests {
         // 401 from the reauth endpoint means the signing key itself is no
         // longer trusted (host record deleted, disabled, …). The daemon's
         // outer-loop branch on AuthRevoked will then warn "re-pair via
-        // pocketshell pair" — which is the only correct response
+        // thumbdesk pair" — which is the only correct response
         // when permanent identity is gone.
         let server = MockServer::start().await;
         Mock::given(method("POST"))

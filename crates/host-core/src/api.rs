@@ -13,6 +13,7 @@ use std::time::Duration;
 /// Domain-separation tag for the host signing-key reauth payload. MUST match
 /// `HOST_REAUTH_SIGNING_PREFIX` in `app/services/auth_service.py`; changing
 /// either side without the other breaks signature verification.
+// A signing domain tag the backend verifies: keeps its pre-rename name.
 const HOST_REAUTH_SIGNING_PREFIX: &[u8] = b"pocketshell-reauth-v1";
 
 /// Reconstruct the byte sequence that gets Ed25519-signed for `/auth/host/reauth`.
@@ -252,7 +253,7 @@ impl BackendClient {
         Self::parse(res, "reauth payload").await
     }
 
-    /// Revoke a refresh token server-side. Called on `pocketshell logout`
+    /// Revoke a refresh token server-side. Called on `thumbdesk logout`
     /// so the 365-day refresh token doesn't outlive the local logout.
     /// Best-effort: network failures are not propagated — the local state
     /// has already been cleared by the time we return.

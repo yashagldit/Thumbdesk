@@ -1,4 +1,4 @@
-//! QR-bound proof for the device key a host pins during `pocketshell pair`.
+//! QR-bound proof for the device key a host pins during `thumbdesk pair`.
 //!
 //! The host puts a fresh random secret in the QR it prints. The phone reads
 //! it optically and sends back, through the backend, an HMAC under that
@@ -17,6 +17,7 @@ use sha2::Sha256;
 use zeroize::Zeroizing;
 
 /// Domain-separation label, the first transcript field.
+/// Shared with the app; keeps its pre-rename name like every signing tag.
 pub const PAIR_PROOF_LABEL: &str = "pocketshell-pair-v1";
 pub const PAIR_MODE_NEW_HOST: &str = "new_host";
 pub const PAIR_MODE_DEVICE_ADD: &str = "device_add";

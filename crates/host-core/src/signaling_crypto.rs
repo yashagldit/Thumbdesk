@@ -11,6 +11,9 @@ use rand::RngCore;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 
+// Every domain tag here is shared with the app (and some with the backend)
+// and keeps its pre-rename name: renaming one breaks every signature and key
+// derivation between versions.
 pub(crate) const PROTOCOL_INFO_PREFIX: &[u8] = b"pocketshell-files-v1";
 
 /// Shared signing-context prefix for signed SDP envelopes. MUST match the

@@ -1,7 +1,7 @@
 //! OS-keyring secret storage with file-based fallback.
 //!
 //! Long-lived host secrets (the ED25519 private key and the refresh token)
-//! used to live in plaintext in `~/.pocketshell/state.json`. Mode 0o600 made
+//! used to live in plaintext in `~/.thumbdesk/state.json`. Mode 0o600 made
 //! that *acceptable* but not great: any backup/sync tool, disk image, or
 //! user-mode process running as the same UID could lift them. This module
 //! pushes those secrets into the platform-native keychain (macOS Keychain,
@@ -15,21 +15,30 @@
 //! Migration: on first save after upgrade, plaintext fields in `state.json`
 //! are moved into the keyring and replaced with empty strings. On read, an
 //! empty field falls through to the keyring.
+//!
+//! The keyring service was `pocketshell-host-agent` before the rename. A
+//! secret not found under the new name is read from the old one, copied to
+//! the new one, and deleted from the old one only once the copy is in.
 
 use crate::error::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, warn};
 
-const SERVICE: &str = "pocketshell-host-agent";
+const SERVICE: &str = "thumbdesk-host-agent";
+
+/// The service name every agent before the rename stored its secrets under.
+/// Read when the new name has nothing, so an existing host keeps its key.
+const LEGACY_SERVICE: &str = "pocketshell-host-agent";
 
 /// Whether to consult the OS keyring at all. The `linux-native` keyring
 /// backend is the kernel keyutils session keyring, which is scoped per
-/// process-tree — secrets written from a `sudo pocketshell pair` invocation
+/// process-tree — secrets written from a `sudo thumbdesk pair` invocation
 /// are not visible to a separately-launched daemon, leading to silent loss
 /// of the host signing key. Default off on Linux; the file fallback in this
 /// module's state dir is the canonical store. Set
-/// `POCKETSHELL_USE_KEYRING=1` to opt back in (e.g. when building against
+/// `THUMBDESK_USE_KEYRING=1` (or `POCKETSHELL_USE_KEYRING=1`) to opt back
+/// in (e.g. when building against
 /// `sync-secret-service` on a desktop with gnome-keyring/kwallet).
 ///
 /// macOS and Windows ship persistent per-user keychains, so the keyring is
@@ -44,7 +53,8 @@ fn use_keyring() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        std::env::var_os("POCKETSHELL_USE_KEYRING")
+        crate::env_var!("USE_KEYRING")
+            .get_os()
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     }
@@ -80,7 +90,11 @@ impl SecretStore {
         match keyring::Entry::new(SERVICE, name) {
             Ok(entry) => match entry.get_password() {
                 Ok(v) => return Ok(Some(v)),
-                Err(keyring::Error::NoEntry) => {}
+                Err(keyring::Error::NoEntry) => {
+                    if let Some(v) = self.take_legacy(name, &entry) {
+                        return Ok(Some(v));
+                    }
+                }
                 Err(e) => {
                     debug!(
                         "keyring get({}/{}) unavailable: {} — falling back to file",
@@ -98,6 +112,36 @@ impl SecretStore {
         self.get_file(name)
     }
 
+    /// The secret as an agent from before the rename stored it, under
+    /// [`LEGACY_SERVICE`], moved to `entry` (the new service). The old item
+    /// is deleted only after the new one is written: a failed write leaves
+    /// it, to be moved on the next read, and the value is returned either way.
+    fn take_legacy(&self, name: &str, entry: &keyring::Entry) -> Option<String> {
+        let legacy = keyring::Entry::new(LEGACY_SERVICE, name).ok()?;
+        let value = match legacy.get_password() {
+            Ok(value) => value,
+            Err(keyring::Error::NoEntry) => return None,
+            Err(e) => {
+                debug!("keyring get({LEGACY_SERVICE}/{name}) unavailable: {e}");
+                return None;
+            }
+        };
+        match entry.set_password(&value) {
+            Ok(()) => match entry.get_password() {
+                // Read back before the only other copy goes.
+                Ok(copied) if copied == value => {
+                    if let Err(e) = legacy.delete_credential() {
+                        debug!("keyring delete({LEGACY_SERVICE}/{name}) error: {e}");
+                    }
+                    debug!("moved keyring secret {name} from {LEGACY_SERVICE} to {SERVICE}");
+                }
+                _ => warn!("keyring copy of {name} to {SERVICE} did not read back; keeping {LEGACY_SERVICE}"),
+            },
+            Err(e) => warn!("keyring set({SERVICE}/{name}) failed: {e}; keeping {LEGACY_SERVICE}"),
+        }
+        Some(value)
+    }
+
     /// Write a secret. Prefers the OS keyring; falls back to a 0o600 file
     /// only if the keyring rejects the write (e.g., headless Linux).
     pub fn put(&self, name: &str, value: &str) -> Result<()> {
@@ -110,6 +154,11 @@ impl SecretStore {
                     // Successfully stored in keyring — wipe any stale file
                     // copy so disk state never has the secret again.
                     let _ = fs::remove_file(self.fallback_path(name));
+                    // Nor an older copy under the service name from before
+                    // the rename (a new refresh token makes it stale).
+                    if let Ok(legacy) = keyring::Entry::new(LEGACY_SERVICE, name) {
+                        let _ = legacy.delete_credential();
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -133,10 +182,14 @@ impl SecretStore {
     /// deletion. Best-effort; ignores "not found" errors.
     pub fn clear(&self, name: &str) -> Result<()> {
         if use_keyring() {
-            if let Ok(entry) = keyring::Entry::new(SERVICE, name) {
-                match entry.delete_credential() {
-                    Ok(()) | Err(keyring::Error::NoEntry) => {}
-                    Err(e) => debug!("keyring delete({}/{}) error: {}", SERVICE, name, e),
+            // The old service too: a logout must not leave a copy for a
+            // later read to bring back.
+            for service in [SERVICE, LEGACY_SERVICE] {
+                if let Ok(entry) = keyring::Entry::new(service, name) {
+                    match entry.delete_credential() {
+                        Ok(()) | Err(keyring::Error::NoEntry) => {}
+                        Err(e) => debug!("keyring delete({}/{}) error: {}", service, name, e),
+                    }
                 }
             }
         }
