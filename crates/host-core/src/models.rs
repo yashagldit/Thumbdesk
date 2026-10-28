@@ -374,26 +374,40 @@ pub struct ProcessInfo {
     /// Seconds the process has been running
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_time_secs: Option<u64>,
+    /// When the process started, in unix seconds. Together with `pid` it names
+    /// one process: `system/kill_process` takes it back as
+    /// `expected_start_time_secs` to refuse a pid that was reused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_time_secs: Option<u64>,
 }
 
+/// Network totals over the physical interfaces only (no loopback, bridges,
+/// veth or tunnels). The totals never decrease while the daemon runs; they
+/// start near "since boot" and may drop on a daemon restart or reboot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkIOStats {
     pub bytes_sent: u64,
     pub bytes_recv: u64,
     pub packets_sent: u64,
     pub packets_recv: u64,
-    /// Per-second rates (None on first sample before a delta can be computed).
+    /// Bytes per second over the requesting consumer's own window (None until
+    /// that consumer has a baseline at least ~1s old).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_sent_per_sec: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_recv_per_sec: Option<u64>,
 }
 
+/// System-wide disk I/O over the host's physical disks, each counted once.
+/// Present in light snapshots too.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskIOStats {
+    /// Bytes read since boot (monotonic while the daemon runs).
     pub read_bytes: u64,
+    /// Bytes written since boot (monotonic while the daemon runs).
     pub write_bytes: u64,
-    /// Per-second rates (None on first sample before a delta can be computed).
+    /// Bytes per second over the requesting consumer's own window (None until
+    /// that consumer has a baseline at least ~1s old).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_bytes_per_sec: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,8 +514,60 @@ pub struct StatsSnapshot {
     pub cpu_per_core: Option<Vec<CpuCoreInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_counts: Option<TaskCounts>,
+    /// User/system/idle/iowait split. Only sent where it is measured (Linux).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_times: Option<CpuTimes>,
+    /// The boot/system disk that `disk_total_bytes`/`disk_used_bytes` describe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_disk: Option<DiskVolume>,
+    /// Every other real volume (deduped by device, boot disk excluded). Never
+    /// summed into the top-level disk fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volumes: Option<Vec<DiskVolume>>,
+    /// What this host can actually measure, so the app can hide what it can't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<StatsCapabilities>,
+    /// Names of the interfaces counted in the `network_io` totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_interfaces: Option<Vec<String>>,
+    /// When the host booted, in unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_time_secs: Option<u64>,
+}
+
+/// Where a non-boot volume lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeKind {
+    Internal,
+    External,
+    Removable,
+    Network,
+}
+
+/// One mounted filesystem's capacity. `kind` is set on `volumes` entries and
+/// absent on `boot_disk`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskVolume {
+    pub name: String,
+    pub mount_point: String,
+    pub file_system: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<VolumeKind>,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// Which optional metrics this platform/host can measure at all. A `false`
+/// means "never coming", not "missing this tick".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatsCapabilities {
+    pub cpu_times: bool,
+    pub temperatures: bool,
+    pub iowait: bool,
+    pub battery: bool,
+    pub process_list: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,6 +912,7 @@ mod tests {
             user: None,
             command: None,
             run_time_secs: None,
+            start_time_secs: None,
         };
         let v = serde_json::to_value(&p).unwrap();
         let obj = v.as_object().unwrap();
@@ -853,6 +920,7 @@ mod tests {
         assert!(!obj.contains_key("user"));
         assert!(!obj.contains_key("command"));
         assert!(!obj.contains_key("run_time_secs"));
+        assert!(!obj.contains_key("start_time_secs"));
         assert_eq!(obj["pid"], 1);
     }
 
@@ -937,6 +1005,11 @@ mod tests {
             cpu_per_core: None,
             task_counts: None,
             cpu_times: None,
+            boot_disk: None,
+            volumes: None,
+            capabilities: None,
+            net_interfaces: None,
+            boot_time_secs: None,
         };
         let v = serde_json::to_value(&snap).unwrap();
         let obj = v.as_object().unwrap();
@@ -951,6 +1024,11 @@ mod tests {
             "cpu_per_core",
             "task_counts",
             "cpu_times",
+            "boot_disk",
+            "volumes",
+            "capabilities",
+            "net_interfaces",
+            "boot_time_secs",
         ] {
             assert!(!obj.contains_key(skipped), "{} should be skipped", skipped);
         }
