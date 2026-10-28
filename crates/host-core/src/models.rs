@@ -559,8 +559,10 @@ pub struct DiskVolume {
     pub available_bytes: u64,
 }
 
-/// Which optional metrics this platform/host can measure at all. A `false`
-/// means "never coming", not "missing this tick".
+/// Which optional metrics this platform/host can measure at all, and which
+/// features this agent has. A `false` means "never coming", not "missing this
+/// tick". The app reads an absent feature flag as "unsupported" (an agent
+/// from before the flag), so a flag is only ever added, never renamed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsCapabilities {
     pub cpu_times: bool,
@@ -568,6 +570,17 @@ pub struct StatsCapabilities {
     pub iowait: bool,
     pub battery: bool,
     pub process_list: bool,
+    /// Disk alert rules honour `AlertThreshold::target` (one volume by mount
+    /// point). Older agents ignore the target and test every disk rule
+    /// against the top-level disk figures.
+    #[serde(default)]
+    pub disk_alert_targets: bool,
+    /// `system/kill_process` can end this host's processes: it answers
+    /// `{ killed, outcome, exited }`, refuses with error codes and checks
+    /// `expected_start_time_secs`. False where there is no kill path
+    /// (Windows refuses every request).
+    #[serde(default)]
+    pub process_kill: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
