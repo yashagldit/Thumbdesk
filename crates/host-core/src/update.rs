@@ -1292,6 +1292,8 @@ mod tests {
         assert_eq!(renamed_bundle(npm), npm);
     }
 
+    // The fake app's binary is a shell script, which Windows cannot run.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_old_layout_archive_lands_as_thumbdesk_app() {
         // codesign is a no-op off macOS and refuses unsigned fakes on it.
@@ -1301,7 +1303,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("staging");
         let old_app = fake_app(&staging, "PocketShell.app", "pocketshell", b"#!/bin/sh\nexit 0\n");
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let exe = old_app.join("Contents/MacOS/pocketshell");
@@ -1465,6 +1466,9 @@ mod tests {
         assert_eq!(fs::read_link(bin.join("pocketshell")).unwrap(), new_exe);
     }
 
+    // App bundles are a macOS thing; on Windows `canonicalize` adds a `\\?\`
+    // prefix the process list's paths lack.
+    #[cfg(unix)]
     #[test]
     fn a_bundle_this_process_runs_from_is_in_use() {
         let exe = std::env::current_exe().unwrap();

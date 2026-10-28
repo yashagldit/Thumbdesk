@@ -19,6 +19,12 @@
 //! The keyring service was `pocketshell-host-agent` before the rename. A
 //! secret not found under the new name is read from the old one, copied to
 //! the new one, and deleted from the old one only once the copy is in.
+//!
+//! The secrets move with the state directory, not before it. While the state
+//! directory is still `~/.pocketshell` (its move waits while a daemon from
+//! before the rename runs from it, see `state_dir`), they stay under the old
+//! service, read and written there: that daemon reads only the old service,
+//! and a new `thumbdesk status` or hook moving them would take it offline.
 
 use crate::error::Result;
 use std::fs;
@@ -64,6 +70,14 @@ fn use_keyring() -> bool {
     }
 }
 
+/// Whether `state_dir` is the state directory from before the rename, still
+/// in use because it has not been moved (see `state_dir`).
+fn is_legacy_state_dir(state_dir: &std::path::Path) -> bool {
+    state_dir
+        .file_name()
+        .is_some_and(|name| name == crate::state_dir::LEGACY_STATE_DIR_NAME)
+}
+
 /// Key under which the host's ED25519 private key is stored.
 pub const KEY_HOST_PRIVATE: &str = "host-private-key";
 /// Key under which the long-lived refresh token is stored.
@@ -73,12 +87,28 @@ pub const KEY_REFRESH_TOKEN: &str = "host-refresh-token";
 #[derive(Debug)]
 pub struct SecretStore {
     fallback_dir: PathBuf,
+    /// The state directory has not been moved yet: the secrets stay under
+    /// [`LEGACY_SERVICE`].
+    legacy: bool,
 }
 
 impl SecretStore {
     /// `fallback_dir` should be the daemon's state dir (already 0o700).
     pub fn new(fallback_dir: PathBuf) -> Self {
-        Self { fallback_dir }
+        let legacy = is_legacy_state_dir(&fallback_dir);
+        Self {
+            fallback_dir,
+            legacy,
+        }
+    }
+
+    /// The keyring service secrets are kept under, and the other one.
+    fn services(&self) -> (&'static str, &'static str) {
+        if self.legacy {
+            (LEGACY_SERVICE, SERVICE)
+        } else {
+            (SERVICE, LEGACY_SERVICE)
+        }
     }
 
     /// Read a secret. Returns `Ok(None)` if neither the keyring nor the
@@ -87,25 +117,36 @@ impl SecretStore {
         if !use_keyring() {
             return self.get_file(name);
         }
-        match keyring::Entry::new(SERVICE, name) {
+        let (service, _) = self.services();
+        match keyring::Entry::new(service, name) {
             Ok(entry) => match entry.get_password() {
                 Ok(v) => return Ok(Some(v)),
                 Err(keyring::Error::NoEntry) => {
-                    if let Some(v) = self.take_legacy(name, &entry) {
+                    let found = if self.legacy {
+                        // Written under the new name by a run that moved it
+                        // before this rule (the old daemon has lost it then).
+                        // Read only: it moves back with the next `put`.
+                        keyring::Entry::new(SERVICE, name)
+                            .ok()
+                            .and_then(|new| new.get_password().ok())
+                    } else {
+                        self.take_legacy(name, &entry)
+                    };
+                    if let Some(v) = found {
                         return Ok(Some(v));
                     }
                 }
                 Err(e) => {
                     debug!(
                         "keyring get({}/{}) unavailable: {} — falling back to file",
-                        SERVICE, name, e
+                        service, name, e
                     );
                 }
             },
             Err(e) => {
                 debug!(
                     "keyring entry construct failed for {}/{}: {} — using file fallback",
-                    SERVICE, name, e
+                    service, name, e
                 );
             }
         }
@@ -148,30 +189,31 @@ impl SecretStore {
         if !use_keyring() {
             return self.put_file(name, value);
         }
-        match keyring::Entry::new(SERVICE, name) {
+        let (service, other) = self.services();
+        match keyring::Entry::new(service, name) {
             Ok(entry) => match entry.set_password(value) {
                 Ok(()) => {
                     // Successfully stored in keyring — wipe any stale file
                     // copy so disk state never has the secret again.
                     let _ = fs::remove_file(self.fallback_path(name));
-                    // Nor an older copy under the service name from before
-                    // the rename (a new refresh token makes it stale).
-                    if let Ok(legacy) = keyring::Entry::new(LEGACY_SERVICE, name) {
-                        let _ = legacy.delete_credential();
+                    // Nor a copy under the other service name (a new refresh
+                    // token makes it stale).
+                    if let Ok(stale) = keyring::Entry::new(other, name) {
+                        let _ = stale.delete_credential();
                     }
                     return Ok(());
                 }
                 Err(e) => {
                     warn!(
                         "keyring set({}/{}) failed: {} — falling back to 0o600 file",
-                        SERVICE, name, e
+                        service, name, e
                     );
                 }
             },
             Err(e) => {
                 warn!(
                     "keyring entry construct failed for {}/{}: {} — using 0o600 file",
-                    SERVICE, name, e
+                    service, name, e
                 );
             }
         }
@@ -235,6 +277,17 @@ mod tests {
     /// throwaway service name unlikely to clash with the host's real
     /// keychain. The underlying `keyring` crate's mock backend is not
     /// public, so we just exercise the file fallback paths directly.
+    #[test]
+    fn secrets_stay_under_the_old_service_until_the_state_dir_moves() {
+        let old = SecretStore::new(PathBuf::from("/home/u/.pocketshell"));
+        assert_eq!(old.services(), (LEGACY_SERVICE, SERVICE));
+        let new = SecretStore::new(PathBuf::from("/home/u/.thumbdesk"));
+        assert_eq!(new.services(), (SERVICE, LEGACY_SERVICE));
+        // A state dir of the user's choosing is not one from before the rename.
+        let custom = SecretStore::new(PathBuf::from("/srv/agent-state"));
+        assert_eq!(custom.services(), (SERVICE, LEGACY_SERVICE));
+    }
+
     #[test]
     fn put_and_get_via_file_fallback() {
         let dir = tempdir().unwrap();
