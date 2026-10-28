@@ -941,8 +941,12 @@ impl Drop for StagingGuard {
 /// Matches `https://github.com/<owner>/<repo>/.github/workflows/release-host-agent.yml@refs/tags/v...`
 /// for any version tag. Anchored with `^` and `$` so a workflow at a similar
 /// path (e.g. a fork's `release-host-agent-test.yml`) cannot satisfy this.
+///
+/// Releases are signed in `yashagldit/PocketShell` (agents before this one
+/// pin only that repo, so it keeps signing while they are around) and may
+/// later be signed in `yashagldit/Thumbdesk`, which this agent accepts too.
 const COSIGN_IDENTITY_REGEXP: &str = concat!(
-    "^https://github\\.com/yashagldit/PocketShell/",
+    "^https://github\\.com/yashagldit/(PocketShell|Thumbdesk)/",
     "\\.github/workflows/release-host-agent\\.yml@refs/tags/v[0-9][0-9A-Za-z.\\-]*$",
 );
 
@@ -1689,7 +1693,7 @@ mod tests {
         // here, not at update time on every user's machine.
         assert!(COSIGN_IDENTITY_REGEXP.starts_with("^https://github\\.com/"));
         assert!(COSIGN_IDENTITY_REGEXP.ends_with("$"));
-        assert!(COSIGN_IDENTITY_REGEXP.contains("yashagldit/PocketShell"));
+        assert!(COSIGN_IDENTITY_REGEXP.contains("yashagldit/(PocketShell|Thumbdesk)/"));
         assert!(COSIGN_IDENTITY_REGEXP.contains("release-host-agent\\.yml"));
         assert!(COSIGN_IDENTITY_REGEXP.contains("refs/tags/v"));
 
@@ -1700,6 +1704,9 @@ mod tests {
         assert!(re.is_match(
             "https://github.com/yashagldit/PocketShell/.github/workflows/release-host-agent.yml@refs/tags/v1.2.3-beta.4"
         ));
+        assert!(re.is_match(
+            "https://github.com/yashagldit/Thumbdesk/.github/workflows/release-host-agent.yml@refs/tags/v1.4.0"
+        ));
         // Negatives that must NOT satisfy the pin:
         assert!(!re.is_match(
             "https://github.com/somebodyelse/PocketShell/.github/workflows/release-host-agent.yml@refs/tags/v0.1.0"
@@ -1709,6 +1716,13 @@ mod tests {
         ));
         assert!(!re.is_match(
             "https://github.com/yashagldit/PocketShell/.github/workflows/release-host-agent-test.yml@refs/tags/v0.1.0"
+        ));
+        // Only those two repos: not a look-alike, nor the private source repo.
+        assert!(!re.is_match(
+            "https://github.com/yashagldit/ThumbdeskX/.github/workflows/release-host-agent.yml@refs/tags/v1.4.0"
+        ));
+        assert!(!re.is_match(
+            "https://github.com/yashagldit/PocketShellApp/.github/workflows/release-host-agent.yml@refs/tags/v1.4.0"
         ));
     }
 
