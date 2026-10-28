@@ -576,6 +576,10 @@ pub struct AlertThreshold {
     pub threshold_value: f64,
     pub comparison: String,
     pub cooldown_minutes: u64,
+    /// Disk rules only: the mount point of the volume to watch. Absent means
+    /// the boot disk (the top-level disk figures).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -584,6 +588,10 @@ pub struct AlertPayload {
     pub threshold_value: f64,
     pub actual_value: f64,
     pub message: String,
+    /// The rule's target (a disk mount point), echoed so the backend can
+    /// record which disk fired. Absent for untargeted rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
