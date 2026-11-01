@@ -1154,25 +1154,33 @@ fn warn_cosign_unusable(reason: &str, archive_name: &str) {
 }
 
 
-/// Whether the installed cosign knows `--new-bundle-format` (2.4+). Read from
-/// its help text, which involves no untrusted input. `None` when cosign cannot
-/// be asked.
-fn cosign_help_mentions_new_bundle_format(help: &str) -> bool {
-    help.contains("--new-bundle-format")
+/// Whether `help`, the output of `cosign verify-blob --help`, is recognisably
+/// that help text yet lacks `--new-bundle-format` (cosign before 2.4). Only
+/// this positive sign of an old cosign skips verification; anything
+/// unrecognisable lets the real verify run and fail closed.
+fn cosign_help_shows_old_cosign(help: &str) -> bool {
+    help.contains("--bundle")
+        && help.contains("--certificate-identity")
+        && !help.contains("--new-bundle-format")
 }
 
+/// Whether to run cosign at all: false only for a cosign whose own help text
+/// shows it predates `--new-bundle-format`. Read from the help, which involves
+/// no untrusted input.
 fn cosign_supports_new_bundle_format() -> bool {
     let mut command = crate::platform::host_command("cosign");
     let Ok(output) = command.args(["verify-blob", "--help"]).output() else {
-        // Unknown: let the real verify decide (and fail closed).
         return true;
     };
+    if !output.status.success() {
+        return true;
+    }
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    cosign_help_mentions_new_bundle_format(&text)
+    !cosign_help_shows_old_cosign(&text)
 }
 
 /// Shell out to `cosign verify-blob` to check the keyless signature bundle
@@ -2036,14 +2044,18 @@ mod tests {
     }
 
     #[test]
-    fn cosign_capability_is_read_from_its_help_text() {
-        assert!(cosign_help_mentions_new_bundle_format(
-            "Flags:\n      --bundle string\n      --new-bundle-format   expect the bundle to be in the new format"
+    fn only_recognisable_old_cosign_help_skips_verification() {
+        // cosign 2.2: verify-blob help without the flag.
+        assert!(cosign_help_shows_old_cosign(
+            "Flags:\n      --bundle string\n      --certificate-identity string\n      --certificate string"
         ));
-        // cosign 2.2's help has no such flag; verify output is never consulted.
-        assert!(!cosign_help_mentions_new_bundle_format(
-            "Flags:\n      --bundle string\n      --certificate string"
+        // cosign 2.4+: the flag is there, so verify runs.
+        assert!(!cosign_help_shows_old_cosign(
+            "Flags:\n      --bundle string\n      --certificate-identity string\n      --new-bundle-format"
         ));
+        // Not verify-blob help at all (a shim, an error): verify runs and fails closed.
+        assert!(!cosign_help_shows_old_cosign(""));
+        assert!(!cosign_help_shows_old_cosign("usage: something else"));
     }
 
     #[test]
