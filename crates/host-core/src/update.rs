@@ -42,11 +42,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// Default release host. The public host-agent repo on GitHub — assets are
-/// served as standard release downloads, no auth required. Keeps its old
-/// name: every released agent updates from this repository, and the release
-/// signatures are pinned to it (`COSIGN_IDENTITY_REGEXP`).
-pub const DEFAULT_BASE_URL: &str = "https://github.com/yashagldit/PocketShell";
+/// Default release host: the Thumbdesk releases repo on GitHub, whose assets
+/// are standard release downloads, no auth required. Agents before 2.0.0
+/// update from `yashagldit/PocketShell`, so each release is published there
+/// too: that is how they get here.
+pub const DEFAULT_BASE_URL: &str = "https://github.com/yashagldit/Thumbdesk";
 
 /// The macOS app's folder name.
 pub const APP_BUNDLE_NAME: &str = "Thumbdesk.app";
@@ -942,9 +942,9 @@ impl Drop for StagingGuard {
 /// for any version tag. Anchored with `^` and `$` so a workflow at a similar
 /// path (e.g. a fork's `release-host-agent-test.yml`) cannot satisfy this.
 ///
-/// Releases are signed in `yashagldit/PocketShell` (agents before this one
-/// pin only that repo, so it keeps signing while they are around) and may
-/// later be signed in `yashagldit/Thumbdesk`, which this agent accepts too.
+/// Each repo signs its own copy of a release. `yashagldit/PocketShell` stays
+/// accepted for the releases already signed there; agents before 1.4.0 pin
+/// only that repo, so it keeps signing while they are around.
 const COSIGN_IDENTITY_REGEXP: &str = concat!(
     "^https://github\\.com/yashagldit/(PocketShell|Thumbdesk)/",
     "\\.github/workflows/release-host-agent\\.yml@refs/tags/v[0-9][0-9A-Za-z.\\-]*$",
