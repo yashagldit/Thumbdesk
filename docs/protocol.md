@@ -244,4 +244,4 @@ proof, device_add = o2NFwP82sB9xfwfFrVWXntL8KA6VdeSgxprRyaRFMaI
 
 The reauth payload is pinned by `build_reauth_payload_format_is_stable` in `api.rs`: `pocketshell-reauth-v1\nh-123\n2026-05-04T03:40:00+00:00`.
 
-Questions and reports: support@thumbdesk.com, or see [SECURITY.md](../SECURITY.md).
+Questions and corrections: open an issue on [yashagldit/Thumbdesk](https://github.com/yashagldit/Thumbdesk/issues), or email support@thumbdesk.com for anything sensitive (see [SECURITY.md](../SECURITY.md)).

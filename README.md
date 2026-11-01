@@ -203,7 +203,7 @@ Process lists, command lines, logged-in users and network connections are shown 
 - **Windows builds are verified by cosign and npm provenance** rather than an Authenticode certificate for now, so SmartScreen may ask once on first run.
 - **Reviewed internally; an independent audit is on the list** and has not yet been commissioned.
 
-Found something? See [SECURITY.md](./SECURITY.md): email support@thumbdesk.com with "Security" in the subject, and we reply within five business days.
+Found something? Open an issue here, or email support@thumbdesk.com with "Security" in the subject for anything sensitive; we reply within five business days. Details in [SECURITY.md](./SECURITY.md).
 
 ---
 
