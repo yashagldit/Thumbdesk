@@ -154,12 +154,21 @@ pub async fn resolve_latest_tag(base_url: &str) -> Result<String> {
         .rsplit('/')
         .find(|seg| !seg.is_empty())
         .unwrap_or("");
-    if tag.is_empty() || tag == "latest" {
+    // A repo with no full release sends /releases/latest to /releases, whose
+    // last segment reads as a tag: it would be offered as an update.
+    if !is_version_tag(tag) {
         return Err(HostError::Config(format!(
             "could not parse release tag from {final_url} — is {base_url} a GitHub repo with a published release?"
         )));
     }
     Ok(tag.to_string())
+}
+
+/// Whether `tag` has the shape every release tag has: `v`, then a digit.
+fn is_version_tag(tag: &str) -> bool {
+    tag.strip_prefix('v')
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|first| first.is_ascii_digit())
 }
 
 /// `app` selects the macOS app archive (`….app.tar.gz`, a whole
@@ -489,6 +498,11 @@ pub async fn download_and_install_with(
 
     info!("extracting {}", info.archive_name);
     let mut command = crate::platform::host_command("tar");
+    // As root, tar would otherwise give the files the owner recorded in the
+    // archive. That id can be an ordinary local user, who could then replace a
+    // binary root runs.
+    #[cfg(unix)]
+    command.arg("--no-same-owner");
     let status = command
         .arg("-xzf")
         .arg(&archive_path)
@@ -1650,6 +1664,17 @@ mod tests {
         assert!(old_pick.symlink_metadata().unwrap().is_file());
         assert_eq!(extracted_binary(&staging), Some(old_pick));
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn only_a_version_counts_as_a_release_tag() {
+        for tag in ["v1.1.0", "v2.0.0", "v2.0.0-rc2"] {
+            assert!(is_version_tag(tag), "{tag}");
+        }
+        // `releases` is what /releases/latest resolves to with no full release.
+        for tag in ["", "latest", "releases", "v", "vnext", "1.1.0"] {
+            assert!(!is_version_tag(tag), "{tag}");
+        }
     }
 
     #[test]
