@@ -554,7 +554,12 @@ pub async fn download_and_install_with(
             .map_err(|e| HostError::Config(format!("read cosign bundle body: {e}")))?;
         fs::write(&bundle_path, bundle_text.as_bytes())
             .map_err(|e| HostError::Config(format!("write cosign bundle: {e}")))?;
-        if verify_cosign_bundle(&archive_path, &bundle_path)? == Cosign::TooOld {
+        // Decided from `cosign verify-blob --help`, never from what the verify
+        // run prints: that output can echo the (downloaded) bundle, so a
+        // crafted bundle could otherwise talk its way past the check.
+        if cosign_supports_new_bundle_format() {
+            verify_cosign_bundle(&archive_path, &bundle_path)?;
+        } else {
             // Treated as no cosign at all: failing would leave a host whose
             // cosign is old with no way to update from the phone.
             warn_cosign_unusable(
@@ -1148,21 +1153,26 @@ fn warn_cosign_unusable(reason: &str, archive_name: &str) {
     );
 }
 
-/// What [`verify_cosign_bundle`] found, when it does not refuse the file.
-#[derive(Debug, PartialEq, Eq)]
-enum Cosign {
-    /// The signature checks out against the pinned workflow identity.
-    Verified,
-    /// This cosign predates `--new-bundle-format` (2.4), so it cannot read
-    /// the bundle at all. It verified nothing, and refused nothing either.
-    TooOld,
+
+/// Whether the installed cosign knows `--new-bundle-format` (2.4+). Read from
+/// its help text, which involves no untrusted input. `None` when cosign cannot
+/// be asked.
+fn cosign_help_mentions_new_bundle_format(help: &str) -> bool {
+    help.contains("--new-bundle-format")
 }
 
-/// Whether cosign's error output says it does not know
-/// `--new-bundle-format`, as a cosign before 2.4 does (cobra's flag parser
-/// prints `unknown flag: --new-bundle-format` before anything is read).
-fn cosign_lacks_new_bundle_format(stderr: &str) -> bool {
-    stderr.contains("unknown flag: --new-bundle-format")
+fn cosign_supports_new_bundle_format() -> bool {
+    let mut command = crate::platform::host_command("cosign");
+    let Ok(output) = command.args(["verify-blob", "--help"]).output() else {
+        // Unknown: let the real verify decide (and fail closed).
+        return true;
+    };
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    cosign_help_mentions_new_bundle_format(&text)
 }
 
 /// Shell out to `cosign verify-blob` to check the keyless signature bundle
@@ -1171,7 +1181,7 @@ fn cosign_lacks_new_bundle_format(stderr: &str) -> bool {
 /// in May 2026 (sigstore-rs is marked experimental; sigstore-verification was
 /// archived 2026-05-18). When sigstore-rs stabilizes, replace this with an
 /// in-process verifier and a baked-in TUF trust root.
-fn verify_cosign_bundle(artifact: &Path, bundle: &Path) -> Result<Cosign> {
+fn verify_cosign_bundle(artifact: &Path, bundle: &Path) -> Result<()> {
     let mut command = crate::platform::host_command("cosign");
     let output = command
         .args(["verify-blob", "--new-bundle-format", "--bundle"])
@@ -1197,12 +1207,9 @@ fn verify_cosign_bundle(artifact: &Path, bundle: &Path) -> Result<Cosign> {
     };
     if output.status.success() {
         info!("cosign verified (identity pinned to release workflow)");
-        return Ok(Cosign::Verified);
+        return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if cosign_lacks_new_bundle_format(&stderr) {
-        return Ok(Cosign::TooOld);
-    }
     Err(HostError::Config(format!(
         "cosign verify-blob rejected the release artifact — refusing to install. \
          Identity required: {COSIGN_IDENTITY_REGEXP}. cosign stderr: {stderr}"
@@ -2029,17 +2036,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_cosign_without_the_bundle_flag_counts_as_too_old() {
-        // What cosign 2.2 prints.
-        assert!(cosign_lacks_new_bundle_format(
-            "Error: unknown flag: --new-bundle-format\nmain.go:74: error during command execution: unknown flag: --new-bundle-format"
+    fn cosign_capability_is_read_from_its_help_text() {
+        assert!(cosign_help_mentions_new_bundle_format(
+            "Flags:\n      --bundle string\n      --new-bundle-format   expect the bundle to be in the new format"
         ));
-        // A real refusal stays a refusal.
-        assert!(!cosign_lacks_new_bundle_format(
-            "Error: none of the expected identities matched what was in the certificate"
-        ));
-        assert!(!cosign_lacks_new_bundle_format(
-            "Error: unknown flag: --something-else"
+        // cosign 2.2's help has no such flag; verify output is never consulted.
+        assert!(!cosign_help_mentions_new_bundle_format(
+            "Flags:\n      --bundle string\n      --certificate string"
         ));
     }
 
