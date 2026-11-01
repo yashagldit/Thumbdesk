@@ -108,7 +108,7 @@ The backend accepts `issued_at` within 30 seconds of its clock and remembers eac
   "host_id": "...", "mobile_device_id": "...", "target_mobile_device_id": "..." }
 ```
 
-**Presence.** A heartbeat every 20 seconds carries the active session count, the number of devices awaiting approval, the agent version and a capability list (which coding-agent CLIs are installed, whether screen capture is available, what the OS supports). Summary metrics ride with it; what they contain is listed in the README.
+**Presence.** A heartbeat every 20 seconds carries the active session count, the number of devices awaiting approval, the agent version and a capability list (which coding-agent CLIs are installed, whether screen capture is available, what the OS supports). Summary metrics go as separate messages on the same socket; what they contain is listed in the README.
 
 **Trusted devices.** The host refreshes its copy of the trusted-device list from `GET /api/v1/hosts/{host_id}/trusted-devices` every 300 seconds (`THUMBDESK_TRUSTED_DEVICES_SECS`). Every authorization decision below is made against that local copy: a device must be approved and not revoked, and must hold the permission the operation needs. `permissions_json` keys are `shell` (older records say `terminal`, which is honoured as an alias) and `stats`; a record with no permissions object at all, as minted by early apps, grants everything. A revocation is refused by the backend relay immediately and takes effect on an already-open direct channel at the host's next sync.
 
@@ -163,7 +163,7 @@ Phone                          Backend                         Host
   |  terminal bytes                                               |
 ```
 
-1. **Open request.** `open_auth` is `{ "v": 1, "nonce", "ts", "signature" }` where the signature covers `pocketshell-session-open-v1|host_id|mobile_device_id|purpose|<hash of attach_target>|nonce|ts`. The backend relays it inside `session_request`, so a backend that altered the purpose or the attach target after the phone signed fails verification at the host, which also applies the 60-second window and the nonce cache. The host answers `session_ack` with `accepted` and a `reason` when refused (`device_not_trusted`, `permission_denied:shell`, `open_auth_invalid`, `pty_failed`).
+1. **Open request.** `open_auth` is `{ "v": 1, "nonce", "ts", "signature" }` where the signature covers `pocketshell-session-open-v1|host_id|mobile_device_id|purpose|<hash of attach_target>|nonce|ts`. The backend relays it inside `session_request`, so a backend that altered the purpose or the attach target after the phone signed fails verification at the host, which also applies the 60-second window and the nonce cache. The host answers `session_ack` with `accepted`, and a `reason` when refused, such as `permission_denied:shell`, `open_auth_invalid` or `pty_failed`.
 2. **Offer.** The phone sends `session_offer` with `payload.sdp`, signed as in section 4.
 3. **Answer.** The host replies `session_answer` with `payload = { "sdp", "type": "answer", "sdp_sig", "sdp_sig_nonce", "sdp_sig_ts" }`, where `sdp_sig` signs `pocketshell-sdp-v1|answer|<nonce>|<ts>|<sdp>` with the host key. The phone verifies it against the key it pinned from the QR, within 60 seconds. If the host's key did not come from a QR, the phone refuses to open a terminal, stats or screen channel at all: keys reported by the backend are not accepted as WebRTC identity.
 4. **ICE.** Candidates travel both ways through the relay; the phone's are signed.
