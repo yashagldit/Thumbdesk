@@ -10,6 +10,7 @@ This repository is the releases channel for the **host agent**, the program that
 
 ```
 .github/workflows/  # builds, signs and publishes each release
+crates/host-core/   # the published part of the agent's source, with its history (Apache-2.0)
 homebrew/           # the Homebrew cask (published to yashagldit/homebrew-thumbdesk)
 npm/thumbdesk/      # the `thumbdesk` npm wrapper
 LICENSE.md          # the host agent's licence
@@ -64,7 +65,7 @@ cosign verify-blob \
 
 ### Source
 
-The host agent's source is not published. Versions up to v1.1.0 (July 2026) are Apache-2.0 and remain available in [yashagldit/PocketShell](https://github.com/yashagldit/PocketShell); they show the pairing and signaling design of that time, not the code in current builds. The mobile app and the backend are closed source.
+The part of the agent you would read to decide whether to trust it is published in [`crates/host-core/`](./crates/host-core/) under Apache-2.0, with its full history: the pairing proof and signaling cryptography, the backend client and every wire model, token refresh and secret storage, the state directory and config, the local audit log, and self-update verification. They are the files in the shipped builds, mirrored commit by commit from the private repository, so `git log` on a file shows what changed and when. The rest of the agent (terminal, screen, files, agents and the daemon itself), the mobile app and the backend are proprietary. Versions up to v1.1.0 (July 2026) are fully Apache-2.0 in [yashagldit/PocketShell](https://github.com/yashagldit/PocketShell).
 
 ---
 

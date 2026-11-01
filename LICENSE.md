@@ -16,6 +16,10 @@ You get a limited, non-exclusive, non-transferable, revocable licence to install
 
 Some earlier versions of the agent were published under the Apache License 2.0. Copies you obtained under that licence remain governed by it. It gives you no right in later versions, the mobile apps, the backend service, or the Thumbdesk name and trademarks.
 
+## Published source
+
+The files under `crates/` in this repository are published under the Apache License 2.0 (see `crates/host-core/LICENSE`). That licence governs them; this agreement governs the agent binaries.
+
 ## Third-party components
 
 The agent includes open-source components, which remain under their own licences. Nothing here limits your rights under those licences.
