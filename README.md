@@ -18,7 +18,7 @@ npm/thumbdesk/      # the `thumbdesk` npm wrapper
 LICENSE.md          # the host agent's licence
 ```
 
-Thumbdesk is built and run by one developer, Yash Agarwal. The full security design, including what each connection mode protects and what the backend handles, is written up at [thumbdesk.com/security](https://thumbdesk.com/security/). Questions and reports: support@thumbdesk.com.
+Thumbdesk is made by A.G. Software Technologies, a sole proprietorship. The full security design, including what each connection mode protects and what the backend handles, is written up at [thumbdesk.com/security](https://thumbdesk.com/security/). Questions and reports: support@thumbdesk.com.
 
 ---
 
