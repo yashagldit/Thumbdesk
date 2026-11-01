@@ -57,15 +57,17 @@ npm i -g thumbdesk
 **Install script** (macOS / Linux) detects your OS and arch, fetches the
 matching tarball from the latest [GitHub
 Release](https://github.com/yashagldit/Thumbdesk/releases), verifies
-its SHA-256 checksum **and the Sigstore cosign keyless signature**
-(pinned to this repo's release workflow identity), then installs to
-`~/.local/bin/thumbdesk` (or `/usr/local/bin/thumbdesk` if run as
-root). Without cosign installed the script refuses to proceed — the
-SHA-256 alone is same-origin integrity, not authenticity, so a
-compromised release publisher could serve a matching checksum for a
-malicious binary. Set `THUMBDESK_SKIP_COSIGN=1` only if you've
-verified the artifact out of band. It's a POSIX shell script — on
-**Windows** use npm (below).
+its SHA-256 checksum and, **if cosign is installed, the Sigstore cosign
+keyless signature** (pinned to this repo's release workflow identity),
+then installs to `~/.local/bin/thumbdesk` (or
+`/usr/local/bin/thumbdesk` if run as root). Without cosign the script
+warns and continues, and `thumbdesk update` does the same. The SHA-256
+alone is same-origin integrity, not authenticity, so a compromised
+release publisher could serve a matching checksum for a malicious
+binary: install cosign if you want that covered. When cosign is
+present, a failed verification stops the install. Set
+`THUMBDESK_SKIP_COSIGN=1` only if you've verified the artifact out of
+band. It's a POSIX shell script — on **Windows** use npm (below).
 
 Read the script first if you'd rather not pipe to bash blindly — it's
 served from the static site and intentionally short.
