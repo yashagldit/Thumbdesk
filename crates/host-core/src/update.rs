@@ -207,9 +207,63 @@ fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
 /// treat it as a different, unpermitted program.
 fn running_from_app() -> bool {
     cfg!(target_os = "macos")
-        && std::env::current_exe()
-            .and_then(fs::canonicalize)
-            .is_ok_and(|exe| app_bundle_of(&exe).is_some())
+        && installed_current_exe().is_ok_and(|exe| app_bundle_of(&exe).is_some())
+}
+
+/// Whether a loose binary at `exe` (resolved) may move into Thumbdesk.app on
+/// update. Not one a package manager put there (npm, Homebrew): the package
+/// expects it where it is, and its next upgrade would bring it back. Not one
+/// whose folder this process cannot write: the move turns `exe` into a link
+/// into the app, and an app installed without that link would be a stray copy
+/// with every later update failing the same way. Those update in place from
+/// the plain archive, as before the app existed.
+fn may_move_into_app(exe: &Path) -> bool {
+    !in_npm_package(exe)
+        && !in_homebrew(exe)
+        && exe.parent().is_some_and(dir_writable)
+        && app_install_dir().is_ok()
+}
+
+/// Whether `path` is inside a Homebrew prefix's packages.
+fn in_homebrew(path: &Path) -> bool {
+    path.starts_with("/opt/homebrew")
+        || path.starts_with("/home/linuxbrew/.linuxbrew")
+        || path
+            .components()
+            .any(|part| part.as_os_str() == "Cellar" || part.as_os_str() == "Caskroom")
+}
+
+/// Whether this process can create files in `dir`.
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(".thumbdesk-probe-{}", std::process::id()));
+    let _ = fs::remove_file(&probe);
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// `info` for the plain binary archive instead of the app archive.
+fn plain_archive(info: &UpdateInfo) -> UpdateInfo {
+    let Some(stem) = info.archive_name.strip_suffix(".app.tar.gz") else {
+        return info.clone();
+    };
+    let plain = format!("{stem}.tar.gz");
+    let swap = |url: &str| url.replace(&info.archive_name, &plain);
+    UpdateInfo {
+        download_url: swap(&info.download_url),
+        checksum_url: swap(&info.checksum_url),
+        cosign_bundle_url: swap(&info.cosign_bundle_url),
+        archive_name: plain,
+        ..info.clone()
+    }
 }
 
 /// Whether the release carries the macOS app archive. Any failure counts as
@@ -310,10 +364,12 @@ pub async fn check(
     let target_triple = detect_target()?;
     // On a Mac the agent lives in Thumbdesk.app. An install already there
     // takes the app archive; a loose binary takes it too, and moves into the
-    // app, when the release has one. Releases from before the app existed do
-    // not, and update the binary in place as they always did.
+    // app, when the release has one and the binary may move
+    // ([`may_move_into_app`]). Releases from before the app existed do not,
+    // and update the binary in place as they always did.
     let app = running_from_app()
         || (cfg!(target_os = "macos")
+            && installed_current_exe().is_ok_and(|exe| may_move_into_app(&exe))
             && app_archive_exists(base_url, &target_version, &target_triple).await);
     let (archive_name, download_url, checksum_url, cosign_bundle_url) =
         build_urls(base_url, &target_version, &target_triple, app);
@@ -357,6 +413,26 @@ pub async fn download_and_install_with(
     info: &UpdateInfo,
     opts: &InstallOptions,
 ) -> Result<PathBuf> {
+    // The installed name, not `<name>.old`: a process still running from the
+    // backup of an earlier update would otherwise install over the backup.
+    let current_exe = installed_current_exe()
+        .map_err(|e| HostError::Config(format!("resolve current exe: {e}")))?;
+    // A loose binary handed the app archive (`check` decides on another
+    // process's view) that may not move into the app takes the plain archive.
+    let plain;
+    let info = if info.archive_name.ends_with(".app.tar.gz")
+        && app_bundle_of(&current_exe).is_none()
+        && !may_move_into_app(&current_exe)
+    {
+        info!(
+            "{} stays where it is: updating it in place, not moving it into {APP_BUNDLE_NAME}",
+            current_exe.display()
+        );
+        plain = plain_archive(info);
+        &plain
+    } else {
+        info
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
@@ -400,9 +476,6 @@ pub async fn download_and_install_with(
 
     // Stage inside the install dir so the final `rename` is on the same
     // filesystem (rename across filesystems would EXDEV).
-    let current_exe = std::env::current_exe()
-        .and_then(fs::canonicalize)
-        .map_err(|e| HostError::Config(format!("resolve current exe: {e}")))?;
     // An app archive replaces the bundle, so it is staged beside the bundle;
     // a binary archive beside the binary. A loose binary handed an app
     // archive is moving into the app: the app is installed fresh and the
@@ -459,19 +532,7 @@ pub async fn download_and_install_with(
         // continue with SHA-256 + (on macOS) codesign as the trust anchors and
         // surface a loud warning. The user can install cosign to re-enable
         // keyless-signature verification on subsequent updates.
-        warn!(
-            "cosign not installed on PATH — skipping keyless signature verification for {}. \
-             SHA-256 (same-origin as the artifact){} was still checked. \
-             Install cosign (`brew install cosign`, `apt install cosign`, or \
-             https://github.com/sigstore/cosign/releases) to re-enable signature \
-             verification on future updates.",
-            info.archive_name,
-            if cfg!(target_os = "macos") {
-                " and Apple codesign"
-            } else {
-                ""
-            }
-        );
+        warn_cosign_unusable("cosign not installed on PATH", &info.archive_name);
     } else {
         let bundle_path = staging.join(format!("{}.cosign-bundle.json", info.archive_name));
         let bundle_text = client
@@ -493,7 +554,14 @@ pub async fn download_and_install_with(
             .map_err(|e| HostError::Config(format!("read cosign bundle body: {e}")))?;
         fs::write(&bundle_path, bundle_text.as_bytes())
             .map_err(|e| HostError::Config(format!("write cosign bundle: {e}")))?;
-        verify_cosign_bundle(&archive_path, &bundle_path)?;
+        if verify_cosign_bundle(&archive_path, &bundle_path)? == Cosign::TooOld {
+            // Treated as no cosign at all: failing would leave a host whose
+            // cosign is old with no way to update from the phone.
+            warn_cosign_unusable(
+                "the installed cosign is older than 2.4 (no --new-bundle-format)",
+                &info.archive_name,
+            );
+        }
     }
 
     info!("extracting {}", info.archive_name);
@@ -581,15 +649,18 @@ pub async fn download_and_install_with(
         )));
     }
 
+    // The new binary is in place from here on: what follows is best effort,
+    // and a failure must not report the install as failed. The archive
+    // records the file as 0755 already.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&current_exe)
-            .map_err(|e| HostError::Config(format!("stat new binary: {e}")))?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&current_exe, perms)
-            .map_err(|e| HostError::Config(format!("chmod new binary: {e}")))?;
+        if let Err(e) = fs::set_permissions(&current_exe, fs::Permissions::from_mode(0o755)) {
+            warn!(
+                "could not make {} executable (0755): {e}",
+                current_exe.display()
+            );
+        }
     }
 
     // tar-extracted binaries on macOS can inherit the quarantine xattr.
@@ -852,8 +923,10 @@ fn swap_app_bundle(new_app: &Path, bundle: &Path) -> Result<()> {
             ))
         });
     }
-    let backup = with_old_suffix(bundle);
-    let _ = fs::remove_dir_all(&backup);
+    // A name of its own: a backup an earlier update could not remove (a
+    // file it cannot delete) would otherwise block every later one.
+    remove_old_app_backups(bundle);
+    let backup = app_backup_path(bundle);
     fs::rename(bundle, &backup).map_err(|e| {
         HostError::Config(format!("move the current app aside ({}): {e}", bundle.display()))
     })?;
@@ -869,6 +942,52 @@ fn swap_app_bundle(new_app: &Path, bundle: &Path) -> Result<()> {
         warn!("could not remove the previous app at {}: {e}", backup.display());
     }
     Ok(())
+}
+
+/// Where [`swap_app_bundle`] moves the current app aside:
+/// `Thumbdesk.app.old-<pid>-<ms>`, beside it. Not a `.app`, so nothing takes
+/// it for an app.
+fn app_backup_path(bundle: &Path) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let mut name = with_old_suffix(bundle).into_os_string();
+    name.push(format!("-{}-{millis}", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// Remove, best effort, what earlier updates left of `bundle` beside it:
+/// `<name>.old` (the fixed name before) and `<name>.old-…`.
+fn remove_old_app_backups(bundle: &Path) {
+    let (Some(dir), Some(name)) = (bundle.parent(), bundle.file_name()) else {
+        return;
+    };
+    let prefix = format!("{}.old", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(rest) = file_name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !(rest.is_empty() || rest.starts_with('-')) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = match path.symlink_metadata() {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&path),
+            _ => fs::remove_file(&path),
+        };
+        if let Err(e) = removed {
+            warn!(
+                "could not remove an earlier app backup at {}: {e}",
+                path.display()
+            );
+        }
+    }
 }
 
 /// How long the staged binary gets to answer `--version`. The first exec of
@@ -931,6 +1050,35 @@ fn probe_binary(binary: &Path, staging: &Path, timeout: Duration) -> Result<()> 
     )))
 }
 
+/// The binary to run or replace for `exe`, this process's own path. A
+/// self-update renames the running binary to `<name>.old` and puts the new
+/// one under its name, and the process then reads its own path as the
+/// backup; on Linux, once that file is gone too, as `<path> (deleted)`.
+/// Anything that starts the agent again, records its path or updates it in
+/// place wants the name the update installed to. Mirrors the private
+/// `installed_binary` in `service.rs`, for the code outside it.
+pub(crate) fn installed_binary(exe: PathBuf) -> PathBuf {
+    let Some(path) = exe.to_str() else {
+        return exe;
+    };
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    let installed = PathBuf::from(path.strip_suffix(".old").unwrap_or(path));
+    if installed != exe && installed.is_file() {
+        installed
+    } else {
+        exe
+    }
+}
+
+/// This process's binary under its installed name ([`installed_binary`]),
+/// resolved through links.
+pub(crate) fn installed_current_exe() -> std::io::Result<PathBuf> {
+    std::env::current_exe()
+        .map(installed_binary)
+        .and_then(fs::canonicalize)
+        .map(installed_binary)
+}
+
 /// `current_exe.with_extension("old")` would mangle `thumbdesk` into
 /// `thumbdesk.old` (correct), but on Windows-style paths with extensions
 /// it would replace the extension. Keep both: `thumbdesk` → `thumbdesk.old`,
@@ -984,13 +1132,46 @@ fn cosign_available() -> bool {
         .is_ok()
 }
 
+/// Warn that the release signature was not checked, and why.
+fn warn_cosign_unusable(reason: &str, archive_name: &str) {
+    warn!(
+        "{reason} — skipping keyless signature verification for {archive_name}. \
+         SHA-256 (same-origin as the artifact){} was still checked. \
+         Install cosign 2.4 or later (`brew install cosign`, `apt install cosign`, or \
+         https://github.com/sigstore/cosign/releases) to re-enable signature \
+         verification on future updates.",
+        if cfg!(target_os = "macos") {
+            " and Apple codesign"
+        } else {
+            ""
+        }
+    );
+}
+
+/// What [`verify_cosign_bundle`] found, when it does not refuse the file.
+#[derive(Debug, PartialEq, Eq)]
+enum Cosign {
+    /// The signature checks out against the pinned workflow identity.
+    Verified,
+    /// This cosign predates `--new-bundle-format` (2.4), so it cannot read
+    /// the bundle at all. It verified nothing, and refused nothing either.
+    TooOld,
+}
+
+/// Whether cosign's error output says it does not know
+/// `--new-bundle-format`, as a cosign before 2.4 does (cobra's flag parser
+/// prints `unknown flag: --new-bundle-format` before anything is read).
+fn cosign_lacks_new_bundle_format(stderr: &str) -> bool {
+    stderr.contains("unknown flag: --new-bundle-format")
+}
+
 /// Shell out to `cosign verify-blob` to check the keyless signature bundle
 /// produced by our release workflow. We require the cosign binary to be
 /// installed on the host — there is no usable production-grade Rust verifier
 /// in May 2026 (sigstore-rs is marked experimental; sigstore-verification was
 /// archived 2026-05-18). When sigstore-rs stabilizes, replace this with an
 /// in-process verifier and a baked-in TUF trust root.
-fn verify_cosign_bundle(artifact: &Path, bundle: &Path) -> Result<()> {
+fn verify_cosign_bundle(artifact: &Path, bundle: &Path) -> Result<Cosign> {
     let mut command = crate::platform::host_command("cosign");
     let output = command
         .args(["verify-blob", "--new-bundle-format", "--bundle"])
@@ -1016,9 +1197,12 @@ fn verify_cosign_bundle(artifact: &Path, bundle: &Path) -> Result<()> {
     };
     if output.status.success() {
         info!("cosign verified (identity pinned to release workflow)");
-        return Ok(());
+        return Ok(Cosign::Verified);
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if cosign_lacks_new_bundle_format(&stderr) {
+        return Ok(Cosign::TooOld);
+    }
     Err(HostError::Config(format!(
         "cosign verify-blob rejected the release artifact — refusing to install. \
          Identity required: {COSIGN_IDENTITY_REGEXP}. cosign stderr: {stderr}"
@@ -1345,7 +1529,67 @@ mod tests {
 
         assert_eq!(fs::read(bundle.join("Contents/MacOS/thumbdesk")).unwrap(), b"new");
         assert!(!bundle.join("Contents/leftover").exists(), "replaced whole, not merged");
-        assert!(!with_old_suffix(&bundle).exists(), "no second copy is kept");
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("Thumbdesk.app.old")),
+            "no second copy is kept: {names:?}"
+        );
+    }
+
+    /// A backup an earlier update could not remove used to block every later
+    /// update ("move the current app aside"). Older backups are cleared when
+    /// they can be, and one that cannot be is stepped round.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_app_backup_does_not_block_the_update() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = fake_app(dir.path(), "Thumbdesk.app", "thumbdesk", b"old");
+        // Removable: the fixed name earlier versions used.
+        let removable = fake_app(dir.path(), "Thumbdesk.app.old", "thumbdesk", b"older");
+        // Not removable: a file in a folder that may not be written.
+        let stuck = dir.path().join("Thumbdesk.app.old-1-2/locked");
+        fs::create_dir_all(&stuck).unwrap();
+        fs::write(stuck.join("file"), b"x").unwrap();
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o555)).unwrap();
+        // Not ours to touch.
+        let other = dir.path().join("Thumbdesk.app.older");
+        fs::create_dir_all(&other).unwrap();
+        let new_app = fake_app(
+            &dir.path().join("staging"),
+            "Thumbdesk.app",
+            "thumbdesk",
+            b"new",
+        );
+
+        let swapped = swap_app_bundle(&new_app, &bundle);
+        fs::set_permissions(&stuck, fs::Permissions::from_mode(0o755)).unwrap();
+
+        swapped.unwrap();
+        assert_eq!(
+            fs::read(bundle.join("Contents/MacOS/thumbdesk")).unwrap(),
+            b"new"
+        );
+        assert!(!removable.exists());
+        assert!(other.exists());
+    }
+
+    #[test]
+    fn an_app_backup_is_named_apart_from_any_app() {
+        let backup = app_backup_path(Path::new("/Applications/Thumbdesk.app"));
+        let name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&format!("Thumbdesk.app.old-{}-", std::process::id())),
+            "{name}"
+        );
+        assert_eq!(backup.parent(), Some(Path::new("/Applications")));
+        assert_ne!(backup.extension().unwrap(), "app");
     }
 
     #[test]
@@ -1675,6 +1919,128 @@ mod tests {
         for tag in ["", "latest", "releases", "v", "vnext", "1.1.0"] {
             assert!(!is_version_tag(tag), "{tag}");
         }
+    }
+
+    #[test]
+    fn the_update_backup_resolves_to_the_installed_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let installed = dir.path().join("pocketshell");
+        let backup = dir.path().join("pocketshell.old");
+        fs::write(&installed, b"new").unwrap();
+        fs::write(&backup, b"old").unwrap();
+        assert_eq!(installed_binary(backup.clone()), installed);
+        assert_eq!(installed_binary(installed.clone()), installed);
+
+        // What Linux's /proc/self/exe shows once the file is gone.
+        let deleted = |path: &Path| PathBuf::from(format!("{} (deleted)", path.display()));
+        assert_eq!(installed_binary(deleted(&backup)), installed);
+        assert_eq!(installed_binary(deleted(&installed)), installed);
+
+        // Nothing under the real name: the path stays as it was.
+        fs::remove_file(&installed).unwrap();
+        assert_eq!(installed_binary(backup.clone()), backup);
+        fs::create_dir(&installed).unwrap();
+        assert_eq!(installed_binary(backup.clone()), backup);
+        let other = dir.path().join("thumbdesk");
+        assert_eq!(installed_binary(other.clone()), other);
+    }
+
+    #[test]
+    fn package_manager_installs_do_not_move_into_the_app() {
+        assert!(in_homebrew(Path::new(
+            "/opt/homebrew/Cellar/thumbdesk/2.0.0/bin/thumbdesk"
+        )));
+        assert!(in_homebrew(Path::new(
+            "/usr/local/Cellar/thumbdesk/2.0.0/bin/thumbdesk"
+        )));
+        assert!(in_homebrew(Path::new(
+            "/usr/local/Caskroom/thumbdesk/2.0.0/thumbdesk"
+        )));
+        assert!(!in_homebrew(Path::new("/usr/local/bin/thumbdesk")));
+        let npm =
+            Path::new("/usr/local/lib/node_modules/@thumbdesk/aarch64-apple-darwin/bin/thumbdesk");
+        assert!(in_npm_package(npm));
+        assert!(!may_move_into_app(npm));
+        assert!(!may_move_into_app(Path::new(
+            "/opt/homebrew/Cellar/thumbdesk/2.0.0/bin/thumbdesk"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_binary_in_a_folder_it_cannot_write_does_not_move_into_the_app() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        assert!(dir_writable(&bin));
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes anywhere; the check is for everyone else.
+        let root = fs::File::create(bin.join("probe")).is_ok();
+        let writable = dir_writable(&bin);
+        let may_move = may_move_into_app(&bin.join("thumbdesk"));
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        if !root {
+            assert!(!writable);
+            assert!(!may_move);
+        }
+        assert_eq!(
+            fs::read_dir(&bin).unwrap().count(),
+            usize::from(root),
+            "no probe left"
+        );
+    }
+
+    #[test]
+    fn a_binary_that_stays_put_takes_the_plain_archive() {
+        let (archive_name, download_url, checksum_url, cosign_bundle_url) = build_urls(
+            "https://github.com/o/r",
+            "v2.0.0",
+            "aarch64-apple-darwin",
+            true,
+        );
+        let app = UpdateInfo {
+            current_version: "1.1.0".into(),
+            target_version: "v2.0.0".into(),
+            target_triple: "aarch64-apple-darwin".into(),
+            archive_name,
+            download_url,
+            checksum_url,
+            cosign_bundle_url,
+            up_to_date: false,
+        };
+        let plain = plain_archive(&app);
+        let (archive, dl, sha, bundle) = build_urls(
+            "https://github.com/o/r",
+            "v2.0.0",
+            "aarch64-apple-darwin",
+            false,
+        );
+        assert_eq!(plain.archive_name, archive);
+        assert_eq!(plain.download_url, dl);
+        assert_eq!(plain.checksum_url, sha);
+        assert_eq!(plain.cosign_bundle_url, bundle);
+        assert_eq!(plain.target_version, "v2.0.0");
+        assert_eq!(
+            plain_archive(&plain).archive_name,
+            archive,
+            "plain stays plain"
+        );
+    }
+
+    #[test]
+    fn only_a_cosign_without_the_bundle_flag_counts_as_too_old() {
+        // What cosign 2.2 prints.
+        assert!(cosign_lacks_new_bundle_format(
+            "Error: unknown flag: --new-bundle-format\nmain.go:74: error during command execution: unknown flag: --new-bundle-format"
+        ));
+        // A real refusal stays a refusal.
+        assert!(!cosign_lacks_new_bundle_format(
+            "Error: none of the expected identities matched what was in the certificate"
+        ));
+        assert!(!cosign_lacks_new_bundle_format(
+            "Error: unknown flag: --something-else"
+        ));
     }
 
     #[test]

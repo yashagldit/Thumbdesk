@@ -137,7 +137,7 @@ impl AppConfig {
 fn default_backend_url() -> Option<&'static str> {
     option_env!("THUMBDESK_DEFAULT_BACKEND_URL")
         .filter(|s| !s.is_empty())
-        .or(option_env!("THUMBDESK_DEFAULT_BACKEND_URL"))
+        .or(option_env!("POCKETSHELL_DEFAULT_BACKEND_URL").filter(|s| !s.is_empty()))
 }
 
 /// The compile-time host WebSocket URL, under its new or its old build
@@ -145,7 +145,7 @@ fn default_backend_url() -> Option<&'static str> {
 fn default_ws_url() -> Option<&'static str> {
     option_env!("THUMBDESK_DEFAULT_WS_URL")
         .filter(|s| !s.is_empty())
-        .or(option_env!("THUMBDESK_DEFAULT_WS_URL"))
+        .or(option_env!("POCKETSHELL_DEFAULT_WS_URL").filter(|s| !s.is_empty()))
 }
 
 /// The user's home. Tests redirect it with `THUMBDESK_TEST_HOME` (or
