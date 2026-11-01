@@ -221,7 +221,16 @@ fn may_move_into_app(exe: &Path) -> bool {
     !in_npm_package(exe)
         && !in_homebrew(exe)
         && exe.parent().is_some_and(dir_writable)
-        && app_install_dir().is_ok()
+        && app_install_dir_candidates().iter().any(|dir| dir.is_dir() && dir_writable(dir))
+}
+
+/// Where Thumbdesk.app may be installed, system folder first.
+fn app_install_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("/Applications")];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join("Applications"));
+    }
+    candidates
 }
 
 /// Whether `path` is inside a Homebrew prefix's packages.
@@ -286,11 +295,9 @@ async fn app_archive_exists(base_url: &str, tag: &str, target: &str) -> bool {
 /// Where a first Thumbdesk.app goes: `/Applications`, or the user's own
 /// `~/Applications` when that is not writable.
 fn app_install_dir() -> Result<PathBuf> {
-    let mut candidates = vec![PathBuf::from("/Applications")];
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(home.join("Applications"));
-    }
-    for dir in candidates {
+    // Creating `~/Applications` is fine here, at install time; a version
+    // check (`may_move_into_app`) only looks at folders that exist.
+    for dir in app_install_dir_candidates() {
         let probe = dir.join(format!(".thumbdesk-probe-{}", std::process::id()));
         if fs::create_dir_all(&probe).is_ok() {
             let _ = fs::remove_dir(&probe);
