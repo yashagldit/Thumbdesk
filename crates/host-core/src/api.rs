@@ -1,0 +1,1393 @@
+use crate::error::{HostError, Result};
+use crate::models::{
+    BackendSessionInfo, HeartbeatRequest, HostInitiatedCreateRequest, HostInitiatedCreateResponse,
+    HostInitiatedDeviceAddRequest, HostInitiatedPollOutcome, HostInitiatedStatusResponse,
+    PairingValidateRequest, PairingValidateResponse, SessionState, TokenPairResponse,
+    TrustedDeviceRecord,
+};
+use reqwest::header::AUTHORIZATION;
+use reqwest::{Client, RequestBuilder, Response, StatusCode};
+use serde::de::DeserializeOwned;
+use std::time::Duration;
+
+/// Domain-separation tag for the host signing-key reauth payload. MUST match
+/// `HOST_REAUTH_SIGNING_PREFIX` in `app/services/auth_service.py`; changing
+/// either side without the other breaks signature verification.
+// A signing domain tag the backend verifies: keeps its pre-rename name.
+const HOST_REAUTH_SIGNING_PREFIX: &[u8] = b"pocketshell-reauth-v1";
+
+/// Reconstruct the byte sequence that gets Ed25519-signed for `/auth/host/reauth`.
+/// MUST produce the exact same bytes as the Python equivalent in
+/// `AuthService.reauth_host_with_signing_key`.
+pub fn build_reauth_payload(host_id: &str, issued_at_iso8601: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        HOST_REAUTH_SIGNING_PREFIX.len() + 2 + host_id.len() + issued_at_iso8601.len(),
+    );
+    buf.extend_from_slice(HOST_REAUTH_SIGNING_PREFIX);
+    buf.push(b'\n');
+    buf.extend_from_slice(host_id.as_bytes());
+    buf.push(b'\n');
+    buf.extend_from_slice(issued_at_iso8601.as_bytes());
+    buf
+}
+
+/// Optional action the backend can request via heartbeat response.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeartbeatAction {
+    None,
+    /// Backend requests the daemon to shut down (e.g. free-tier limit).
+    Kill,
+}
+
+#[derive(Clone)]
+pub struct BackendClient {
+    base_url: String,
+    client: Client,
+}
+
+/// Total deadline for a control-plane request. Every endpoint on this client is
+/// a short JSON REST call (no streaming, no long-polling), so a total timeout is
+/// safe here — unlike the dev-server proxy in `http_forward`, which deliberately
+/// omits one so SSE streams aren't cut off mid-flight.
+///
+/// This bound matters beyond politeness: the daemon awaits several of these
+/// calls *inline* in its control-plane `select!` loop, so an unbounded request
+/// against a black-holed backend wedges the entire loop — the same failure shape
+/// as the `close_peer`/`get_stats` hang.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Where the human-readable detail of a non-2xx response comes from.
+///
+/// Kept explicit because the two flavours are not interchangeable: reading the
+/// body consumes the response (and costs a round-trip on large errors), while
+/// `Status` only formats the code. Endpoints historically picked one or the
+/// other, and the message text is asserted by tests, so the choice is part of
+/// each endpoint's declared policy rather than something to normalize.
+#[derive(Clone, Copy, PartialEq)]
+enum Detail {
+    Body,
+    Status,
+}
+
+/// Per-endpoint declaration of how non-2xx statuses are classified.
+///
+/// The point of this type is that an endpoint's error policy is now *one
+/// visible argument* instead of a hand-rolled `if` ladder. The asymmetries
+/// between endpoints (notably: several do not map 401 to `AuthRevoked`) are
+/// preserved verbatim — they are now reviewable in one place instead of
+/// hiding in twenty near-identical ladders.
+#[derive(Clone, Copy)]
+struct ErrorPolicy {
+    /// 401 -> `HostError::AuthRevoked`, so the daemon escalates to
+    /// refresh/reauth instead of treating the endpoint as merely broken.
+    revoked_on_401: bool,
+    /// 403 -> `HostError::HostGone` (ownership check failed: host deleted).
+    host_gone_on_403: bool,
+    /// 404 -> `HostError::HostGone` (host row no longer exists).
+    host_gone_on_404: bool,
+    /// 402 -> `HostError::QuotaExhausted` (a metered allowance is spent).
+    quota_on_402: bool,
+    detail: Detail,
+}
+
+impl ErrorPolicy {
+    /// Generic failures report the response body.
+    fn body() -> Self {
+        Self {
+            revoked_on_401: false,
+            host_gone_on_403: false,
+            host_gone_on_404: false,
+            quota_on_402: false,
+            detail: Detail::Body,
+        }
+    }
+
+    /// Generic failures report only the status code.
+    fn status() -> Self {
+        Self {
+            detail: Detail::Status,
+            ..Self::body()
+        }
+    }
+
+    fn revoked_on_401(mut self) -> Self {
+        self.revoked_on_401 = true;
+        self
+    }
+
+    fn host_gone_on_403(mut self) -> Self {
+        self.host_gone_on_403 = true;
+        self
+    }
+
+    fn host_gone_on_404(mut self) -> Self {
+        self.host_gone_on_404 = true;
+        self
+    }
+
+    fn quota_on_402(mut self) -> Self {
+        self.quota_on_402 = true;
+        self
+    }
+}
+
+impl BackendClient {
+    /// Attach the host bearer token. Every authenticated endpoint goes through
+    /// here so the header shape is spelled once.
+    fn authed(&self, rb: RequestBuilder, token: &str) -> RequestBuilder {
+        rb.header(AUTHORIZATION, format!("Bearer {token}"))
+    }
+
+    /// Send a request, mapping transport errors to `HostError::Backend`.
+    async fn send(rb: RequestBuilder) -> Result<Response> {
+        rb.send()
+            .await
+            .map_err(|e| HostError::Backend(e.to_string()))
+    }
+
+    /// Apply an endpoint's [`ErrorPolicy`] to the response status.
+    ///
+    /// Returns the response untouched on 2xx. `ctx` is the failure prefix,
+    /// e.g. `"token refresh failed"` -> `"token refresh failed: <detail>"`.
+    async fn check(res: Response, ctx: &str, policy: ErrorPolicy) -> Result<Response> {
+        let status = res.status();
+
+        if policy.revoked_on_401 && status == StatusCode::UNAUTHORIZED {
+            return Err(HostError::AuthRevoked);
+        }
+        if (policy.host_gone_on_403 && status == StatusCode::FORBIDDEN)
+            || (policy.host_gone_on_404 && status == StatusCode::NOT_FOUND)
+        {
+            return Err(HostError::HostGone);
+        }
+        if status.is_success() {
+            return Ok(res);
+        }
+
+        let detail = match policy.detail {
+            Detail::Body => {
+                let body = res.text().await.unwrap_or_default();
+                format!("{ctx}: {body}")
+            }
+            Detail::Status => format!("{ctx}: {status}"),
+        };
+        if policy.quota_on_402 && status == StatusCode::PAYMENT_REQUIRED {
+            return Err(HostError::QuotaExhausted(detail));
+        }
+        Err(HostError::Backend(detail))
+    }
+
+    /// Decode a JSON body. `ctx` is the noun in `"invalid <ctx>: <err>"`,
+    /// e.g. `"refresh payload"` or `"approve response"`.
+    async fn parse<T: DeserializeOwned>(res: Response, ctx: &str) -> Result<T> {
+        res.json::<T>()
+            .await
+            .map_err(|e| HostError::Backend(format!("invalid {ctx}: {e}")))
+    }
+
+    pub fn new(base_url: impl Into<String>) -> Self {
+        let client = Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            // `Client::builder().build()` only fails if the TLS backend can't
+            // initialize, in which case a default client would fail too.
+            .unwrap_or_else(|_| Client::new());
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client,
+        }
+    }
+
+    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<TokenPairResponse> {
+        let url = format!("{}/api/v1/auth/token/refresh", self.base_url);
+        let res = Self::send(
+            self.client
+                .post(url)
+                .json(&serde_json::json!({"refresh_token": refresh_token})),
+        )
+        .await?;
+
+        let res = Self::check(
+            res,
+            "token refresh failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
+        Self::parse(res, "refresh payload").await
+    }
+
+    /// Re-authenticate as a host using its permanent Ed25519 signing key.
+    ///
+    /// Recovery path when `/token/refresh` returns 401 — the refresh token
+    /// is gone (Redis JTI loss, rotation race, manual revocation) but the
+    /// host can still prove identity by signing a recent timestamp with
+    /// the private key registered at pairing time. Backend looks up the
+    /// public key in Postgres, so this works through Redis outages.
+    ///
+    /// `issued_at_iso8601` must be the **exact** string that was signed —
+    /// the server reconstructs the payload byte-for-byte and any
+    /// reformatting (e.g. timezone normalization) breaks verification.
+    /// Use [`build_reauth_payload`] to keep client and server in sync.
+    pub async fn host_reauth(
+        &self,
+        host_id: &str,
+        issued_at_iso8601: &str,
+        signature_b64: &str,
+    ) -> Result<TokenPairResponse> {
+        let url = format!("{}/api/v1/auth/host/reauth", self.base_url);
+        let res = Self::send(self.client.post(url).json(&serde_json::json!({
+            "host_id": host_id,
+            "issued_at": issued_at_iso8601,
+            "signature": signature_b64,
+        })))
+        .await?;
+
+        let res = Self::check(
+            res,
+            "host reauth failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
+        Self::parse(res, "reauth payload").await
+    }
+
+    /// Revoke a refresh token server-side. Called on `thumbdesk logout`
+    /// so the 365-day refresh token doesn't outlive the local logout.
+    /// Best-effort: network failures are not propagated — the local state
+    /// has already been cleared by the time we return.
+    pub async fn logout(&self, refresh_token: &str) -> Result<()> {
+        let url = format!("{}/api/v1/auth/logout", self.base_url);
+        // NOTE: unlike every other endpoint this labels the *transport* error
+        // ("logout request failed") rather than using the bare reqwest string,
+        // so it does not use the shared `send` helper.
+        let res = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({"refresh_token": refresh_token}))
+            .send()
+            .await
+            .map_err(|e| HostError::Backend(format!("logout request failed: {e}")))?;
+
+        Self::check(res, "logout failed", ErrorPolicy::body()).await?;
+        Ok(())
+    }
+
+    pub async fn validate_pairing_code(
+        &self,
+        payload: &PairingValidateRequest,
+    ) -> Result<PairingValidateResponse> {
+        let url = format!("{}/api/v1/pairing/codes/validate", self.base_url);
+        let res = Self::send(self.client.post(url).json(payload)).await?;
+
+        // No 401 arm: unauthenticated endpoint, a 401 here is not a revoked
+        // host token. (Asymmetry preserved deliberately.)
+        let res = Self::check(res, "pairing validate failed", ErrorPolicy::body()).await?;
+        Self::parse(res, "host registration payload").await
+    }
+
+    /// Start a host-initiated pairing claim. No auth required; `pair_attestation`
+    /// proves possession of `public_key`'s private key and is what lets the
+    /// backend reattach an already-registered host.
+    pub async fn start_host_initiated(
+        &self,
+        hostname: &str,
+        platform: &str,
+        public_key: &str,
+        app_version: &str,
+        pair_attestation: Option<crate::models::PairAttestation>,
+    ) -> Result<HostInitiatedCreateResponse> {
+        let url = format!("{}/api/v1/pairing/host-initiated", self.base_url);
+        let payload = HostInitiatedCreateRequest {
+            hostname: hostname.to_string(),
+            platform: platform.to_string(),
+            public_key: public_key.to_string(),
+            app_version: app_version.to_string(),
+            pair_attestation,
+        };
+        let res = Self::send(self.client.post(url).json(&payload)).await?;
+
+        let res = Self::check(
+            res,
+            "host-initiated pairing start failed",
+            ErrorPolicy::body(),
+        )
+        .await?;
+        Self::parse(res, "host-initiated create payload").await
+    }
+
+    /// Start a host-initiated device-add claim. Requires host auth (Bearer access token).
+    /// Used when an already-paired host wants to add a new mobile device.
+    pub async fn start_host_initiated_device_add(
+        &self,
+        token: &str,
+        host_id: &str,
+    ) -> Result<HostInitiatedCreateResponse> {
+        let url = format!("{}/api/v1/pairing/host-initiated/device-add", self.base_url);
+        let payload = HostInitiatedDeviceAddRequest {
+            existing_host_id: host_id.to_string(),
+        };
+        let res = Self::send(self.authed(self.client.post(url), token).json(&payload)).await?;
+
+        // 403 on this endpoint means the backend doesn't recognize this host as
+        // owned by the authenticated user — typically because the host was
+        // deleted from the mobile app. Surface as HostGone so the caller can
+        // auto-recover by re-registering as a new host.
+        let res = Self::check(
+            res,
+            "host-initiated device-add start failed",
+            ErrorPolicy::body().revoked_on_401().host_gone_on_403(),
+        )
+        .await?;
+        Self::parse(res, "host-initiated create payload").await
+    }
+
+    /// Poll the status of a host-initiated claim. No auth required.
+    pub async fn poll_host_initiated_status(
+        &self,
+        claim_token: &str,
+    ) -> Result<HostInitiatedPollOutcome> {
+        let url = format!("{}/api/v1/pairing/host-initiated/status", self.base_url);
+        let res = Self::send(
+            self.client
+                .post(url)
+                .json(&serde_json::json!({ "claim_token": claim_token })),
+        )
+        .await?;
+
+        // Bespoke ladder: 410/404 are *successful* domain outcomes here, not
+        // errors, so this endpoint can't express its policy via `check`.
+        match res.status() {
+            StatusCode::GONE => Ok(HostInitiatedPollOutcome::AlreadyDelivered),
+            StatusCode::NOT_FOUND => Ok(HostInitiatedPollOutcome::Expired),
+            s if s.is_success() => {
+                let body: HostInitiatedStatusResponse =
+                    Self::parse(res, "host-initiated status payload").await?;
+                if body.status == "claimed" {
+                    Ok(HostInitiatedPollOutcome::Claimed(Box::new(body)))
+                } else {
+                    Ok(HostInitiatedPollOutcome::Pending)
+                }
+            }
+            other => {
+                let body = res.text().await.unwrap_or_default();
+                Err(HostError::Backend(format!(
+                    "host-initiated poll failed ({other}): {body}"
+                )))
+            }
+        }
+    }
+
+    pub async fn send_heartbeat(
+        &self,
+        token: &str,
+        payload: &HeartbeatRequest,
+    ) -> Result<HeartbeatAction> {
+        let url = format!(
+            "{}/api/v1/presence/hosts/{}/heartbeat",
+            self.base_url, payload.host_id
+        );
+        let res = Self::send(self.authed(self.client.post(url), token).json(payload)).await?;
+
+        let res = Self::check(
+            res,
+            "presence heartbeat failed",
+            ErrorPolicy::status().revoked_on_401(),
+        )
+        .await?;
+
+        // Check if backend is requesting an action (e.g. kill for free-tier)
+        let body: serde_json::Value = Self::parse(res, "heartbeat response").await?;
+
+        if let Some(action) = body.get("action").and_then(|v| v.as_str()) {
+            if action == "kill" {
+                return Ok(HeartbeatAction::Kill);
+            }
+        }
+
+        Ok(HeartbeatAction::None)
+    }
+
+    pub async fn mark_offline(&self, token: &str, host_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/v1/presence/hosts/{}/offline",
+            self.base_url, host_id
+        );
+        let res = Self::send(self.authed(self.client.post(&url), token)).await?;
+
+        // No 401 arm today: a revoked token here is reported as a plain
+        // Backend error. (Asymmetry preserved deliberately.)
+        Self::check(res, "mark offline failed", ErrorPolicy::status()).await?;
+        Ok(())
+    }
+
+    /// Send one crash or diagnostic report (`diagnostics`). Returns the
+    /// status, whatever it is: the caller decides what a refusal means for
+    /// the report. Bounded at 10 s; a transport error is an `Err`.
+    pub async fn post_agent_report(
+        &self,
+        token: &str,
+        host_id: &str,
+        report: &serde_json::Value,
+    ) -> Result<u16> {
+        let url = format!("{}/api/v1/hosts/{}/reports", self.base_url, host_id);
+        let res = Self::send(
+            self.authed(self.client.post(&url), token)
+                .timeout(Duration::from_secs(10))
+                .json(report),
+        )
+        .await?;
+        Ok(res.status().as_u16())
+    }
+
+    /// Fetch the authenticated user's profile (email, display name).
+    pub async fn get_me(&self, token: &str) -> Result<crate::models::UserProfile> {
+        let url = format!("{}/api/v1/users/me", self.base_url);
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
+
+        let res = Self::check(res, "get_me failed", ErrorPolicy::status().revoked_on_401()).await?;
+        Self::parse(res, "user profile payload").await
+    }
+
+    pub async fn list_trusted_devices(
+        &self,
+        token: &str,
+        host_id: &str,
+    ) -> Result<Vec<TrustedDeviceRecord>> {
+        let url = format!("{}/api/v1/hosts/{}/trusted-devices", self.base_url, host_id);
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
+
+        // 404 here means the user deleted this host from the mobile app —
+        // backend's trusted_device_service raises 404 "Host not found" when
+        // the host_id no longer maps to a row owned by the authenticated user.
+        // 403 is the same outcome for ownership-check failures elsewhere.
+        let res = Self::check(
+            res,
+            "trusted-device list failed",
+            ErrorPolicy::status()
+                .revoked_on_401()
+                .host_gone_on_403()
+                .host_gone_on_404(),
+        )
+        .await?;
+        Self::parse(res, "trusted-device payload").await
+    }
+
+    pub async fn approve_device(
+        &self,
+        token: &str,
+        host_id: &str,
+        mobile_device_id: &str,
+    ) -> Result<TrustedDeviceRecord> {
+        let url = format!(
+            "{}/api/v1/hosts/{}/trusted-devices/approve",
+            self.base_url, host_id
+        );
+        let res = Self::send(
+            self.authed(self.client.post(url), token)
+                .json(&serde_json::json!({
+                    "mobile_device_id": mobile_device_id,
+                    "permissions_json": {"terminal": true, "stats": true}
+                })),
+        )
+        .await?;
+
+        // No 401/403 arms today despite being an authenticated, host-scoped
+        // endpoint. (Asymmetry preserved deliberately.)
+        let res = Self::check(res, "approve failed", ErrorPolicy::body()).await?;
+        Self::parse(res, "approve response").await
+    }
+
+    pub async fn revoke_device(
+        &self,
+        token: &str,
+        host_id: &str,
+        mobile_device_id: &str,
+    ) -> Result<TrustedDeviceRecord> {
+        let url = format!(
+            "{}/api/v1/hosts/{}/trusted-devices/revoke",
+            self.base_url, host_id
+        );
+        let res = Self::send(
+            self.authed(self.client.post(url), token)
+                .json(&serde_json::json!({"mobile_device_id": mobile_device_id})),
+        )
+        .await?;
+
+        // No 401/403 arms today. (Asymmetry preserved deliberately.)
+        let res = Self::check(res, "revoke failed", ErrorPolicy::body()).await?;
+        Self::parse(res, "revoke response").await
+    }
+
+    pub async fn transition_session(
+        &self,
+        token: &str,
+        session_id: &str,
+        state: SessionState,
+        connection_mode: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/api/v1/sessions/{}", self.base_url, session_id);
+        let mut payload = serde_json::json!({"state": state.as_str()});
+        if let Some(mode) = connection_mode {
+            payload["connection_mode"] = serde_json::Value::String(mode.to_string());
+        }
+
+        let res = Self::send(self.authed(self.client.patch(url), token).json(&payload)).await?;
+
+        // No 401 arm today. (Asymmetry preserved deliberately.)
+        Self::check(res, "session transition failed", ErrorPolicy::body()).await?;
+        Ok(())
+    }
+
+    /// Fetch active (CONNECTED + DETACHED) sessions for this host from the backend.
+    /// Returns a list of `{"id": "...", "state": "..."}` objects.
+    pub async fn list_active_sessions(
+        &self,
+        token: &str,
+        host_id: &str,
+    ) -> Result<Vec<(String, SessionState)>> {
+        let url = format!("{}/api/v1/sessions/host/{}/active", self.base_url, host_id);
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
+
+        let res = Self::check(
+            res,
+            "list active sessions failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
+
+        // Kept as raw `Value`: unknown/garbage `state` values are *dropped*
+        // here rather than surfaced, which a typed enum would not reproduce.
+        let body: Vec<serde_json::Value> = Self::parse(res, "sessions payload").await?;
+
+        Ok(body
+            .into_iter()
+            .filter_map(|v| {
+                let id = v.get("id")?.as_str()?.to_string();
+                let state_str = v.get("state")?.as_str()?;
+                let state = match state_str {
+                    "CONNECTED" | "connected" => SessionState::Connected,
+                    "DETACHED" | "detached" => SessionState::Detached,
+                    _ => return None,
+                };
+                Some((id, state))
+            })
+            .collect())
+    }
+
+    /// Fetch active sessions with full detail from the backend.
+    pub async fn list_active_sessions_full(
+        &self,
+        token: &str,
+        host_id: &str,
+    ) -> Result<Vec<BackendSessionInfo>> {
+        let url = format!(
+            "{}/api/v1/sessions/host/{}/active?include_pending=true",
+            self.base_url, host_id
+        );
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
+
+        let res = Self::check(
+            res,
+            "list active sessions failed",
+            ErrorPolicy::body().revoked_on_401(),
+        )
+        .await?;
+
+        // `BackendSessionInfo`'s field attributes carry the same missing-field
+        // and wrong-type tolerance the hand-rolled `Value` plucking used to.
+        Self::parse(res, "sessions payload").await
+    }
+
+    pub async fn turn_credentials(
+        &self,
+        token: &str,
+    ) -> Result<(String, String, i64, Vec<String>)> {
+        let url = format!("{}/api/v1/webrtc/turn-credentials", self.base_url);
+        let res = Self::send(self.authed(self.client.get(url), token)).await?;
+
+        // A 401 here MUST surface as `AuthRevoked` so the daemon's outer loop
+        // escalates to refresh/reauth. Returning a generic `Backend` error
+        // instead is what makes a rejected host token look like "TURN is
+        // unavailable": every offer then fails, sessions degrade silently to
+        // the backend WS relay (laggy, and with no badge to say so), and the
+        // daemon never tries to re-authenticate because nothing told it the
+        // token was the problem. A 402 is the spent monthly quota, which the
+        // TURN cache backs off from for longer.
+        let res = Self::check(
+            res,
+            "turn credentials request failed",
+            ErrorPolicy::body().revoked_on_401().quota_on_402(),
+        )
+        .await?;
+
+        // Left as raw `Value` on purpose: every field degrades to a default on
+        // a missing *or* wrongly-typed value, and a typed struct would have to
+        // re-implement that leniency to avoid turning a sloppy backend payload
+        // into a hard "TURN is unavailable".
+        let body: serde_json::Value = Self::parse(res, "turn payload").await?;
+
+        let username = body
+            .get("username")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let credential = body
+            .get("credential")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let ttl_seconds = body
+            .get("ttl_seconds")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let uris = body
+            .get("uris")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Ok((username, credential, ttl_seconds, uris))
+    }
+
+    pub async fn report_turn_usage(&self, token: &str, bytes_used: u64) -> Result<()> {
+        let url = format!("{}/api/v1/webrtc/turn-usage", self.base_url);
+        let res = Self::send(
+            self.authed(self.client.post(url), token)
+                .json(&serde_json::json!({ "bytes_used": bytes_used })),
+        )
+        .await?;
+
+        Self::check(
+            res,
+            "turn usage report failed",
+            ErrorPolicy::status().revoked_on_401(),
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{HeartbeatRequest, PairingValidateRequest};
+    use serde_json::json;
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sample_host_json() -> serde_json::Value {
+        json!({
+            "id": "h1",
+            "user_id": "u1",
+            "hostname": "host.local",
+            "platform": "linux",
+            "public_key": "pk",
+            "app_version": "1.0.0",
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_seen_at": null,
+            "status": "online",
+        })
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_sends_refresh_and_parses_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/token/refresh"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({"refresh_token": "r-tok"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-a",
+                "refresh_token": "new-r",
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let resp = c.refresh_tokens("r-tok").await.unwrap();
+        assert_eq!(resp.access_token, "new-a");
+        assert_eq!(resp.refresh_token, "new-r");
+        assert_eq!(resp.token_type.as_deref(), Some("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_maps_401_to_auth_revoked() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/token/refresh"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let err = c.refresh_tokens("r").await.unwrap_err();
+        assert!(matches!(err, HostError::AuthRevoked), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_tokens_500_returns_backend_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/token/refresh"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let err = c.refresh_tokens("r").await.unwrap_err();
+        match err {
+            HostError::Backend(msg) => assert!(msg.contains("boom")),
+            other => panic!("expected Backend, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn base_url_trailing_slash_is_trimmed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/token/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "a", "refresh_token": "r", "token_type": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(format!("{}/", server.uri()));
+        c.refresh_tokens("x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validate_pairing_code_posts_body_and_parses_response() {
+        let server = MockServer::start().await;
+        let req = PairingValidateRequest {
+            code: "ABC123".into(),
+            hostname: "hn".into(),
+            platform: "linux".into(),
+            public_key: "pk".into(),
+            app_version: Some("1.0".into()),
+            host_id: None,
+            pair_attestation: None,
+        };
+
+        let mut host = sample_host_json();
+        host["access_token"] = json!("a");
+        host["refresh_token"] = json!("r");
+        host["token_type"] = json!("Bearer");
+        host["already_paired"] = json!(false);
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/codes/validate"))
+            .and(body_json(&req))
+            .respond_with(ResponseTemplate::new(200).set_body_json(host))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let resp = c.validate_pairing_code(&req).await.unwrap();
+        assert_eq!(resp.access_token, "a");
+        assert_eq!(resp.host.id, "h1");
+        assert!(!resp.already_paired);
+    }
+
+    #[tokio::test]
+    async fn validate_pairing_code_failure_returns_backend_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/codes/validate"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad code"))
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let req = PairingValidateRequest {
+            code: "X".into(),
+            hostname: "h".into(),
+            platform: "l".into(),
+            public_key: "p".into(),
+            app_version: None,
+            host_id: None,
+            pair_attestation: None,
+        };
+        let err = c.validate_pairing_code(&req).await.unwrap_err();
+        match err {
+            HostError::Backend(msg) => assert!(msg.contains("bad code")),
+            other => panic!("expected Backend, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_host_initiated_sends_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated"))
+            .and(body_json(json!({
+                "hostname": "hn",
+                "platform": "linux",
+                "public_key": "pk",
+                "app_version": "1.0",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "claim_token": "claim-xyz",
+                "expires_at": "2030-01-01T00:00:00Z",
+            })))
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let resp = c
+            .start_host_initiated("hn", "linux", "pk", "1.0", None)
+            .await
+            .unwrap();
+        assert_eq!(resp.claim_token, "claim-xyz");
+    }
+
+    #[tokio::test]
+    async fn device_add_uses_bearer_and_maps_401_and_403() {
+        // 401 -> AuthRevoked
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated/device-add"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let err = c
+            .start_host_initiated_device_add("tok", "h1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostError::AuthRevoked));
+
+        // 403 -> HostGone
+        let server2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated/device-add"))
+            .and(header("authorization", "Bearer tok"))
+            .and(body_json(json!({"existing_host_id": "h1"})))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server2)
+            .await;
+        let c2 = BackendClient::new(server2.uri());
+        let err2 = c2
+            .start_host_initiated_device_add("tok", "h1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err2, HostError::HostGone), "got {err2:?}");
+    }
+
+    #[tokio::test]
+    async fn device_add_success_returns_claim() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated/device-add"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "claim_token": "ct",
+                "expires_at": "2030-01-01T00:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let r = c
+            .start_host_initiated_device_add("tok", "h1")
+            .await
+            .unwrap();
+        assert_eq!(r.claim_token, "ct");
+    }
+
+    #[tokio::test]
+    async fn poll_host_initiated_status_variants() {
+        // pending
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated/status"))
+            .and(body_json(json!({ "claim_token": "t1" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "pending"
+            })))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let out = c.poll_host_initiated_status("t1").await.unwrap();
+        assert!(matches!(out, HostInitiatedPollOutcome::Pending));
+
+        // claimed
+        let server2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated/status"))
+            .and(body_json(json!({ "claim_token": "t2" })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "claimed",
+                "access_token": "at"
+            })))
+            .mount(&server2)
+            .await;
+        let c2 = BackendClient::new(server2.uri());
+        let out2 = c2.poll_host_initiated_status("t2").await.unwrap();
+        match out2 {
+            HostInitiatedPollOutcome::Claimed(b) => {
+                assert_eq!(b.status, "claimed");
+                assert_eq!(b.access_token.as_deref(), Some("at"));
+            }
+            other => panic!("expected Claimed, got {:?}", std::mem::discriminant(&other)),
+        }
+
+        // 410 -> AlreadyDelivered
+        let server3 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated/status"))
+            .and(body_json(json!({ "claim_token": "t3" })))
+            .respond_with(ResponseTemplate::new(410))
+            .mount(&server3)
+            .await;
+        let c3 = BackendClient::new(server3.uri());
+        let out3 = c3.poll_host_initiated_status("t3").await.unwrap();
+        assert!(matches!(out3, HostInitiatedPollOutcome::AlreadyDelivered));
+
+        // 404 -> Expired
+        let server4 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/pairing/host-initiated/status"))
+            .and(body_json(json!({ "claim_token": "t4" })))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server4)
+            .await;
+        let c4 = BackendClient::new(server4.uri());
+        let out4 = c4.poll_host_initiated_status("t4").await.unwrap();
+        assert!(matches!(out4, HostInitiatedPollOutcome::Expired));
+    }
+
+    #[tokio::test]
+    async fn send_heartbeat_detects_kill_and_none() {
+        let server = MockServer::start().await;
+        let hb = HeartbeatRequest {
+            host_id: "h1".into(),
+            active_sessions: 2,
+            pending_devices: 0,
+            app_version: None,
+            cli_capabilities: None,
+        };
+        Mock::given(method("POST"))
+            .and(path("/api/v1/presence/hosts/h1/heartbeat"))
+            .and(header("authorization", "Bearer tk"))
+            .and(body_json(&hb))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"action": "kill"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let action = c.send_heartbeat("tk", &hb).await.unwrap();
+        assert_eq!(action, HeartbeatAction::Kill);
+
+        // No action
+        let server2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/presence/hosts/h1/heartbeat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server2)
+            .await;
+        let c2 = BackendClient::new(server2.uri());
+        let a2 = c2.send_heartbeat("tk", &hb).await.unwrap();
+        assert_eq!(a2, HeartbeatAction::None);
+
+        // 401
+        let server3 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/presence/hosts/h1/heartbeat"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server3)
+            .await;
+        let c3 = BackendClient::new(server3.uri());
+        let err = c3.send_heartbeat("tk", &hb).await.unwrap_err();
+        assert!(matches!(err, HostError::AuthRevoked));
+    }
+
+    #[tokio::test]
+    async fn mark_offline_posts_with_bearer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/presence/hosts/h1/offline"))
+            .and(header("authorization", "Bearer tk"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        c.mark_offline("tk", "h1").await.unwrap();
+
+        let server2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/presence/hosts/h1/offline"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server2)
+            .await;
+        let c2 = BackendClient::new(server2.uri());
+        assert!(c2.mark_offline("tk", "h1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_trusted_devices_parses_array_and_handles_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts/h1/trusted-devices"))
+            .and(header("authorization", "Bearer tk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "id": "td1",
+                    "host_id": "h1",
+                    "mobile_device_id": "m1",
+                    "approved_at": null,
+                    "revoked_at": null,
+                    "permissions_json": null,
+                    "created_at": "2024-01-01T00:00:00Z"
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let list = c.list_trusted_devices("tk", "h1").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "td1");
+
+        let server2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hosts/h1/trusted-devices"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server2)
+            .await;
+        let c2 = BackendClient::new(server2.uri());
+        let err = c2.list_trusted_devices("tk", "h1").await.unwrap_err();
+        assert!(matches!(err, HostError::AuthRevoked));
+    }
+
+    #[tokio::test]
+    async fn approve_device_sends_permissions_and_returns_record() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hosts/h1/trusted-devices/approve"))
+            .and(header("authorization", "Bearer tk"))
+            .and(body_json(json!({
+                "mobile_device_id": "m1",
+                "permissions_json": {"terminal": true, "stats": true}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "td1",
+                "host_id": "h1",
+                "mobile_device_id": "m1",
+                "approved_at": "2024-01-01T00:00:00Z",
+                "revoked_at": null,
+                "permissions_json": null,
+                "created_at": "2024-01-01T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let rec = c.approve_device("tk", "h1", "m1").await.unwrap();
+        assert_eq!(rec.mobile_device_id, "m1");
+        assert!(rec.approved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn revoke_device_sends_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hosts/h1/trusted-devices/revoke"))
+            .and(header("authorization", "Bearer tk"))
+            .and(body_json(json!({"mobile_device_id": "m1"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "td1",
+                "host_id": "h1",
+                "mobile_device_id": "m1",
+                "approved_at": null,
+                "revoked_at": "2024-01-01T00:00:00Z",
+                "permissions_json": null,
+                "created_at": "2024-01-01T00:00:00Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let r = c.revoke_device("tk", "h1", "m1").await.unwrap();
+        assert!(r.revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn transition_session_patches_with_state_and_mode() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/sessions/s1"))
+            .and(header("authorization", "Bearer tk"))
+            .and(body_json(
+                json!({"state": "connected", "connection_mode": "p2p"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        c.transition_session("tk", "s1", SessionState::Connected, Some("p2p"))
+            .await
+            .unwrap();
+
+        // Without connection_mode
+        let server2 = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/sessions/s2"))
+            .and(body_json(json!({"state": "ended"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(1)
+            .mount(&server2)
+            .await;
+        let c2 = BackendClient::new(server2.uri());
+        c2.transition_session("tk", "s2", SessionState::Ended, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_active_sessions_filters_and_maps_states() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/sessions/host/h1/active"))
+            .and(header("authorization", "Bearer tk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"id": "s1", "state": "CONNECTED"},
+                {"id": "s2", "state": "detached"},
+                {"id": "s3", "state": "GARBAGE"},
+                {"state": "connected"}, // missing id - filtered
+            ])))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let list = c.list_active_sessions("tk", "h1").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], ("s1".to_string(), SessionState::Connected));
+        assert_eq!(list[1], ("s2".to_string(), SessionState::Detached));
+    }
+
+    #[tokio::test]
+    async fn list_active_sessions_401_to_auth_revoked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/sessions/host/h1/active"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let err = c.list_active_sessions("tk", "h1").await.unwrap_err();
+        assert!(matches!(err, HostError::AuthRevoked));
+    }
+
+    #[tokio::test]
+    async fn list_active_sessions_full_parses_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/sessions/host/h1/active"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {
+                    "id": "s1",
+                    "state": "CONNECTED",
+                    "started_at": "2024-01-01T00:00:00Z",
+                    "ended_at": null,
+                    "connection_mode": "p2p",
+                    "mobile_device_id": "m1",
+                    "purpose": "agent"
+                }
+            ])))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let list = c.list_active_sessions_full("tk", "h1").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "s1");
+        assert_eq!(list[0].connection_mode.as_deref(), Some("p2p"));
+        assert_eq!(list[0].mobile_device_id.as_deref(), Some("m1"));
+        assert_eq!(list[0].purpose.as_deref(), Some("agent"));
+        assert!(list[0].ended_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn turn_credentials_parses_all_fields_and_defaults() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/webrtc/turn-credentials"))
+            .and(header("authorization", "Bearer tk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "username": "u",
+                "credential": "c",
+                "ttl_seconds": 3600,
+                "uris": ["turn:a", "turn:b"]
+            })))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let (u, cred, ttl, uris) = c.turn_credentials("tk").await.unwrap();
+        assert_eq!(u, "u");
+        assert_eq!(cred, "c");
+        assert_eq!(ttl, 3600);
+        assert_eq!(uris, vec!["turn:a".to_string(), "turn:b".to_string()]);
+
+        // Missing fields default safely
+        let server2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/webrtc/turn-credentials"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server2)
+            .await;
+        let c2 = BackendClient::new(server2.uri());
+        let (u2, _c2, ttl2, uris2) = c2.turn_credentials("tk").await.unwrap();
+        assert!(u2.is_empty());
+        assert_eq!(ttl2, 0);
+        assert!(uris2.is_empty());
+    }
+
+    /// A rejected host token must escalate to `AuthRevoked` so the daemon
+    /// reauthenticates. When this mapped to a generic `Backend` error, a
+    /// backend that stopped accepting host tokens looked like "TURN is down":
+    /// every P2P offer failed and sessions silently degraded to the WS relay.
+    #[tokio::test]
+    async fn turn_credentials_401_is_auth_revoked() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/webrtc/turn-credentials"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("token rejected"))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let err = c.turn_credentials("tk").await.unwrap_err();
+        assert!(
+            matches!(err, HostError::AuthRevoked),
+            "expected AuthRevoked, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_credentials_failure_returns_backend_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/webrtc/turn-credentials"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let err = c.turn_credentials("tk").await.unwrap_err();
+        match err {
+            HostError::Backend(m) => assert!(m.contains("nope")),
+            other => panic!("expected Backend got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_credentials_402_is_quota_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/webrtc/turn-credentials"))
+            .respond_with(ResponseTemplate::new(402).set_body_string("quota spent"))
+            .mount(&server)
+            .await;
+        let c = BackendClient::new(server.uri());
+        let err = c.turn_credentials("tk").await.unwrap_err();
+        match err {
+            HostError::QuotaExhausted(m) => assert!(m.contains("quota spent")),
+            other => panic!("expected QuotaExhausted got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // /auth/host/reauth
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_reauth_payload_format_is_stable() {
+        // This test pins the exact wire format. If it changes, the Python
+        // verifier has to change in lockstep — bumping this test is a
+        // signal that we need a coordinated server deploy.
+        let bytes = build_reauth_payload("h-123", "2026-05-04T03:40:00+00:00");
+        assert_eq!(
+            bytes,
+            b"pocketshell-reauth-v1\nh-123\n2026-05-04T03:40:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_reauth_posts_payload_and_parses_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/host/reauth"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({
+                "host_id": "h-1",
+                "issued_at": "2026-05-04T03:40:00+00:00",
+                "signature": "sig-b64",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh-a",
+                "refresh_token": "fresh-r",
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let resp = c
+            .host_reauth("h-1", "2026-05-04T03:40:00+00:00", "sig-b64")
+            .await
+            .unwrap();
+        assert_eq!(resp.access_token, "fresh-a");
+        assert_eq!(resp.refresh_token, "fresh-r");
+    }
+
+    #[tokio::test]
+    async fn host_reauth_maps_401_to_auth_revoked() {
+        // 401 from this endpoint means signature/timestamp/host invalid —
+        // the daemon's outer loop maps `AuthRevoked` to the user-visible
+        // "re-pair required" path, which is the right escalation when the
+        // signing key itself is no longer trusted.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/host/reauth"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "detail": "Invalid signature"
+            })))
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let err = c
+            .host_reauth("h-1", "2026-05-04T03:40:00+00:00", "sig")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HostError::AuthRevoked), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn host_reauth_500_returns_backend_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/host/reauth"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("kapow"))
+            .mount(&server)
+            .await;
+
+        let c = BackendClient::new(server.uri());
+        let err = c
+            .host_reauth("h-1", "2026-05-04T03:40:00+00:00", "sig")
+            .await
+            .unwrap_err();
+        match err {
+            HostError::Backend(m) => assert!(m.contains("kapow")),
+            other => panic!("expected Backend, got {other:?}"),
+        }
+    }
+}
