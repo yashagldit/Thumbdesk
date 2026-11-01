@@ -2,7 +2,7 @@
 
 This document describes how a phone running the Thumbdesk app and a machine running the Thumbdesk host agent establish trust and open connections, and what each party can and cannot do along the way. It matches host agent 2.0.0 and the 2.0 apps. The host-side implementation of everything here is published in [`../crates/host-core/src/`](../crates/host-core/src/) (`pairing_proof.rs`, `signaling_crypto.rs`, `api.rs`, `transport.rs`, `models.rs`, `auth.rs`); where this document and that code disagree, the code is right and the document has a bug.
 
-Conventions: byte strings are base64 (standard alphabet, padded) unless stated; timestamps are Unix seconds; signatures are Ed25519 over the UTF-8 bytes of the string shown; `|` is a literal pipe in a joined string. Every signed string starts with a domain tag so a signature made for one purpose cannot be presented for another. The tags keep their original `pocketshell-` names because they are shared with apps already installed.
+Conventions: byte strings are base64 (standard alphabet, padded) unless stated; timestamps are Unix seconds except where an ISO-8601 string is shown; signatures are Ed25519 over the UTF-8 bytes of the string shown; `|` is a literal pipe in a joined string. Every signed string starts with a domain tag so a signature made for one purpose cannot be presented for another. The tags keep their original `pocketshell-` names because they are shared with apps already installed.
 
 | Tag | Signed by | Purpose |
 |---|---|---|
@@ -39,7 +39,7 @@ POST /api/v1/pairing/host-initiated
   "pair_attestation": { "sig", "nonce", "ts" } }
 ```
 
-`pair_attestation.sig` signs `pocketshell-pair-attest-v1|host-initiated-create|<public_key>|<nonce>|<ts>` with the host's private key. A public key is not a secret, so this is what lets the backend reattach an existing host record to a reinstalled agent that recovered its key from the keychain; without a valid attestation the backend creates a new record instead. The response is `{ "claim_token", "expires_at" }`. The claim lives five minutes, is single-use, and only its SHA-256 is stored.
+`pair_attestation.sig` signs `pocketshell-pair-attest-v1|host-initiated-create|<public_key>|<nonce>|<ts>` with the host's private key. A public key is not a secret, so this is what lets the backend reattach an existing host record to a reinstalled agent that recovered its key from the keychain. If the key already belongs to a host and the attestation is missing or does not verify, the request is refused; a new record is created only for a key no host has. The response is `{ "claim_token", "expires_at" }`. The claim lives five minutes, is single-use, and only its SHA-256 is stored.
 
 For `device_add` the host is already authenticated and calls `POST /api/v1/pairing/host-initiated/device-add` with `{ "existing_host_id" }` instead.
 
@@ -50,11 +50,11 @@ For `device_add` the host is already authenticated and calls `POST /api/v1/pairi
   "hostname": "...", "platform": "...", "bu": "<backend base URL>", "ps": "<pairing secret>" }
 ```
 
-`ps` is 32 fresh random bytes (base64url, unpadded) that exist only in the memory of this one `pair` command. They are never sent to the backend, logged or written to disk. `pubkey` is how the phone learns the host's key: from something displayed on the machine, not from the backend.
+`ps` is 32 fresh random bytes (base64url, unpadded) that exist only in the memory of this one `pair` command. They are never sent to the backend, logged or written to disk. `pubkey` is how the phone learns the host's key: from something displayed on the machine, not from the backend. A `device_add` QR has the same fields plus `"host_id"`, which is how the phone knows to use the `device_add` transcript mode below.
 
 ### 2.3 The phone claims it
 
-The phone scans the QR, stores the host's public key with source `qr`, and computes a proof that it did:
+The phone scans the QR and computes a proof that it did:
 
 ```
 transcript = len("pocketshell-pair-v1") "pocketshell-pair-v1"
@@ -74,11 +74,11 @@ POST /api/v1/pairing/host-initiated/claim
   "device_name"?, "platform"? }
 ```
 
-The backend checks the claim is unexpired and unused, that a `device_add` claim comes from the account that owns the host, creates the host and trusted-device records, issues host tokens, and stores `device_proof` verbatim. It cannot check the proof: it never had `ps`.
+The backend checks the claim is unexpired and unused and that a `device_add` claim comes from the account that owns the host. For `new_host` it creates the host record and issues the host's tokens; in both modes it records the trusted device and stores `device_proof` verbatim. It cannot check the proof: it never had `ps`. Once the claim succeeds, the phone stores the host's public key from the QR with source `qr`.
 
 ### 2.4 The host verifies and pins
 
-The host polls `POST /api/v1/pairing/host-initiated/status { "claim_token" }` every two seconds until it is `claimed`. The response carries the host record, `access_token`, `refresh_token`, `mobile_device_id`, `device_public_key` and `device_proof`.
+The host polls `POST /api/v1/pairing/host-initiated/status { "claim_token" }` every two seconds until it is `claimed`. The response carries `mode`, `mobile_device_id`, `device_public_key` and `device_proof`; for `new_host` it also carries the host record, `access_token` and `refresh_token`.
 
 Before saving anything, the host recomputes the HMAC over the exact `mobile_device_id` and `device_public_key` it is about to pin, together with the `claim_token` and `host_public_key` it printed, and compares in constant time.
 
@@ -99,7 +99,7 @@ POST /api/v1/auth/host/reauth { "host_id", "issued_at", "signature" }
 signature = Ed25519( "pocketshell-reauth-v1\n" + host_id + "\n" + issued_at )
 ```
 
-The backend accepts `issued_at` within 30 seconds of its clock and remembers each `(host_id, issued_at)` for that window, so a captured request cannot be replayed.
+`issued_at` is an ISO-8601 timestamp. The backend accepts it within 30 seconds of its clock and remembers each `(host_id, issued_at)` for 60 seconds, so a captured request cannot be replayed.
 
 **Signaling socket.** The daemon connects to `wss://<backend>/ws/host` with `Authorization: Bearer <access token>` and keeps it open. Every signaling message is a JSON envelope:
 
@@ -110,7 +110,7 @@ The backend accepts `issued_at` within 30 seconds of its clock and remembers eac
 
 **Presence.** A heartbeat every 20 seconds carries the active session count, the number of devices awaiting approval, the agent version and a capability list (which coding-agent CLIs are installed, whether screen capture is available, what the OS supports). Summary metrics go as separate messages on the same socket; what they contain is listed in the README.
 
-**Trusted devices.** The host refreshes its copy of the trusted-device list from `GET /api/v1/hosts/{host_id}/trusted-devices` every 300 seconds (`THUMBDESK_TRUSTED_DEVICES_SECS`). Every authorization decision below is made against that local copy: a device must be approved and not revoked, and must hold the permission the operation needs. `permissions_json` keys are `shell` (older records say `terminal`, which is honoured as an alias) and `stats`; a record with no permissions object at all, as minted by early apps, grants everything. A revocation is refused by the backend relay immediately and takes effect on an already-open direct channel at the host's next sync.
+**Trusted devices.** The host refreshes its copy of the trusted-device list from `GET /api/v1/hosts/{host_id}/trusted-devices` every 300 seconds (`THUMBDESK_TRUSTED_DEVICES_SECS`). Every authorization decision below is made against that local copy: a device must be approved and not revoked, and must hold the permission the operation needs. `permissions_json` keys are `shell` (older records say `terminal`, which is honoured as an alias), `stats`, and `sessions` (utility sessions on the host, and the backend's check for `host_control`); a record with no permissions object at all, as minted by early apps, grants everything. After a revocation the backend relay stops forwarding for that device within 30 seconds (it caches a trust decision per connection for that long), and an already-open direct channel is closed at the host's next sync.
 
 ## 4. Signed signaling messages
 
@@ -133,7 +133,7 @@ The types that require it, and the permission each needs:
 
 Because the payload hash covers the SDP inside an offer, and an SDP contains the `a=fingerprint` of the DTLS certificate the phone will present, the phone's WebRTC identity is bound to its pinned Ed25519 key by this signature.
 
-Messages the backend itself sends to the host (`session_request`, `host_control`) are not signed by a device. They are gated on device trust and permissions, and their consequences are limited: for example the backend cannot trigger a self-update through `host_control`; that command is only accepted over an authenticated channel from a paired phone.
+Messages the backend itself sends to the host are not signed by a device, so what each can do is bounded in other ways. `session_request` is gated on the device's trust and permission and, when it carries `open_auth`, on the device's signature (section 5). `host_control` (close all sessions, restart) is checked by the backend for trust and the `sessions` permission and by the host for trust; it cannot trigger a self-update, which the host accepts only over an authenticated channel from a paired phone. `daemon_kill` (sent when the owner uninstalls or stops the agent from the app) and `alert_preferences_sync` act on the account's word alone. So a compromised backend could stop the agent or change alert thresholds, which is why those are the only things it can do without a device signature.
 
 ## 5. Opening a terminal session
 
@@ -163,12 +163,12 @@ Phone                          Backend                         Host
   |  terminal bytes                                               |
 ```
 
-1. **Open request.** `open_auth` is `{ "v": 1, "nonce", "ts", "signature" }` where the signature covers `pocketshell-session-open-v1|host_id|mobile_device_id|purpose|<hash of attach_target>|nonce|ts`. The backend relays it inside `session_request`, so a backend that altered the purpose or the attach target after the phone signed fails verification at the host, which also applies the 60-second window and the nonce cache. The host answers `session_ack` with `accepted`, and a `reason` when refused, such as `permission_denied:shell`, `open_auth_invalid` or `pty_failed`.
+1. **Open request.** `open_auth` is `{ "v": 1, "nonce", "ts", "signature" }` where the signature covers `pocketshell-session-open-v1|host_id|mobile_device_id|purpose|<hash of attach_target>|nonce|ts`. The backend relays it inside `session_request`, so a backend that altered the purpose or the attach target after the phone signed fails verification at the host, which also applies the 60-second window and the nonce cache. The host answers `session_ack` with `accepted`, and a `reason` when refused, such as `permission_denied`, `open_auth_invalid` or `pty_failed`. Current apps always send `open_auth`. If a request arrives without it, the host treats it as the backend's word rather than the device's: it starts or attaches the terminal but releases no output until the device sends a signed message for that session, so a backend that drops the block gets a process started and nothing read or typed.
 2. **Offer.** The phone sends `session_offer` with `payload.sdp`, signed as in section 4.
-3. **Answer.** The host replies `session_answer` with `payload = { "sdp", "type": "answer", "sdp_sig", "sdp_sig_nonce", "sdp_sig_ts" }`, where `sdp_sig` signs `pocketshell-sdp-v1|answer|<nonce>|<ts>|<sdp>` with the host key. The phone verifies it against the key it pinned from the QR, within 60 seconds. If the host's key did not come from a QR, the phone refuses to open a terminal, stats or screen channel at all: keys reported by the backend are not accepted as WebRTC identity.
+3. **Answer.** The host replies `session_answer` with `payload = { "sdp", "type": "answer", "sdp_sig", "sdp_sig_nonce", "sdp_sig_ts" }`, where `sdp_sig` signs `pocketshell-sdp-v1|answer|<nonce>|<ts>|<sdp>` with the host key. The phone verifies it against the key it pinned from the QR, within 60 seconds. If the host's key did not come from a QR, the phone refuses to open a terminal, stats, files or screen channel at all: keys reported by the backend are not accepted as WebRTC identity.
 4. **ICE.** Candidates travel both ways through the relay; the phone's are signed.
 5. **DTLS.** WebRTC's own handshake, whose certificates match the fingerprints inside the two signed SDPs. Through TURN, the relay forwards this ciphertext.
-6. **Channel authentication.** Before a data channel is used, the host sends a challenge framed with the sentinel `\0PSAU`: `{ "type": "auth_challenge", "nonce": "<32 random bytes>" }`. The phone replies `{ "type": "auth_response", "signature" }`, signing the raw nonce bytes followed by the channel key and its `mobile_device_id`. The channel key is `<kind>:<mobile_device_id>` (`terminal:…`, `stats:…`, `files:…`, `screen:…`); for dev-server forwarding it is per channel instance and the challenge names it in `channel_key`. The host verifies with the pinned key, checks the permission for that kind (`stats` for stats, `shell` for everything else), and answers `auth_result`. Only an authenticated channel carries bytes. Opening a new channel of the same kind supersedes the old one's authentication.
+6. **Channel authentication.** Before a data channel is used, the host sends a challenge framed with the sentinel `\0PSAU`: `{ "type": "auth_challenge", "nonce": "<32 random bytes>" }`. The phone replies `{ "type": "auth_response", "signature" }`, signing the raw nonce bytes followed by a channel key and its `mobile_device_id`. The channel key depends on the kind: the terminal signs the `session_id`; stats and the control channel sign `<kind>:<mobile_device_id>`; screen, files and dev-server forwarding sign a per-instance key the challenge names in `channel_key` (`screen:<device>:<n>`, `fs2:<device>:<n>`); agent channels sign `agent:<host_id>:<device>`. The host verifies with the pinned key, checks the permission for that kind (`stats` for stats, `shell` for everything else), and answers `auth_result`. Only an authenticated channel carries bytes. Opening a new channel of the same kind supersedes the old one's authentication.
 
 Stats, screen and files channels follow the same offer, answer, ICE and `\0PSAU` steps with their own `*_offer` types. A revoked device's channels are closed at the host's next trusted-device sync.
 
@@ -213,7 +213,7 @@ Each host verifies the signature with the phone key it pinned at pairing, requir
 | Check | Where | Window |
 |---|---|---|
 | Pairing claim | backend | 5 minutes, single use |
-| Host re-authentication | backend | 30 seconds, `(host_id, issued_at)` remembered |
+| Host re-authentication | backend | 30 seconds, `(host_id, issued_at)` remembered for 60 |
 | Signed signaling message (`ws_auth`) | host | 60 seconds, nonce remembered 120 seconds per device |
 | Session open request (`open_auth`) | host | 60 seconds, nonce remembered |
 | Host's signed SDP, key exchange, capabilities | phone | 60 seconds |
@@ -223,9 +223,9 @@ Each host verifies the signature with the phone key it pinned at pairing, requir
 
 ## 9. What the backend can and cannot do
 
-It can: see who is talking to whom and when; refuse to relay; read terminal frames that pass through the relay path in section 5; read unsealed file operations if the exchange in section 6 fails.
+It can: see who is talking to whom and when; refuse to relay, or delay a revocation by up to 30 seconds; read terminal frames that pass through the relay path in section 5; read unsealed file operations if the exchange in section 6 fails; stop the agent or change its alert thresholds (section 4); start a terminal process that nothing can read from or type into (section 5).
 
-It cannot: pair a phone of its own choosing to a host (section 2.4); make a phone accept a key for a host other than the one on the QR (section 2.3, 5.3); open a session, send a keystroke or start a share as a trusted phone (sections 4 and 5); read sealed file operations or agent chat (section 6); read anything that crosses a direct or TURN WebRTC path; or trigger a self-update of the agent (section 4).
+It cannot: pair a phone of its own choosing to a host (section 2.4); make a phone accept a key for a host other than the one on the QR (sections 2.3 and 5); read from or type into a session, open a channel, or start a share as a trusted phone (sections 4 and 5); read sealed file operations or agent chat (section 6); read anything that crosses a direct or TURN WebRTC path; or trigger a self-update of the agent (section 4).
 
 ## 10. Test vectors
 
