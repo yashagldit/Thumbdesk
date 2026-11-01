@@ -422,6 +422,25 @@ impl BackendClient {
         Ok(())
     }
 
+    /// Send one crash or diagnostic report (`diagnostics`). Returns the
+    /// status, whatever it is: the caller decides what a refusal means for
+    /// the report. Bounded at 10 s; a transport error is an `Err`.
+    pub async fn post_agent_report(
+        &self,
+        token: &str,
+        host_id: &str,
+        report: &serde_json::Value,
+    ) -> Result<u16> {
+        let url = format!("{}/api/v1/hosts/{}/reports", self.base_url, host_id);
+        let res = Self::send(
+            self.authed(self.client.post(&url), token)
+                .timeout(Duration::from_secs(10))
+                .json(report),
+        )
+        .await?;
+        Ok(res.status().as_u16())
+    }
+
     /// Fetch the authenticated user's profile (email, display name).
     pub async fn get_me(&self, token: &str) -> Result<crate::models::UserProfile> {
         let url = format!("{}/api/v1/users/me", self.base_url);
