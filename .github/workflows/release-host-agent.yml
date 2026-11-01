@@ -1,0 +1,243 @@
+name: Release host agent
+
+# The host agent's release. The build happens in the private source repository
+# (yashagldit/PocketShellApp, release-build.yml), which publishes it there as
+# an unsigned release, commits this file, the `thumbdesk` npm wrapper, the
+# Homebrew cask template and the README here, and pushes the version tag. This
+# workflow then:
+#
+#   1. downloads that build and checks every file against its .sha256,
+#   2. signs every file with cosign (keyless) and publishes the release here,
+#   3. points the Homebrew cask at the new disk image (not for a prerelease),
+#   4. publishes `thumbdesk` and @thumbdesk/<triple> to npm (not for a
+#      prerelease).
+#
+# Agents from 1.4.0 accept this file in this repository, and from 2.0.0 update
+# from here. Keep its path and name:
+# `^https://github.com/yashagldit/Thumbdesk/.github/workflows/release-host-agent.yml@refs/tags/v…`.
+#
+# yashagldit/PocketShell publishes the same build for older agents, which only
+# know that repository: they update there once, to a build that updates here.
+#
+# The source of this file lives in the private repository, under
+# release-public/thumbdesk/; an edit made here is overwritten by the next
+# release.
+#
+# Assets keep their `pocketshell-<tag>-<triple>` names: updaters and install
+# scripts in the field look them up by that name.
+#
+# Required repository secrets:
+#   PRIVATE_RELEASE_TOKEN  fine-grained token, Contents read-only on
+#                          yashagldit/PocketShellApp: downloads the build.
+#   TAP_DEPLOY_KEY         private half of a write deploy key on
+#                          yashagldit/homebrew-thumbdesk: commits the cask.
+# npm publishes with Trusted Publishing (OIDC), no token: see publish-npm.yml.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual re-run path for the npm publish step alone, in case it failed
+  # on the original tag push (npm registry outage, trusted-publisher
+  # misconfig, etc.). When triggered this way, the sign-and-publish and
+  # mirror jobs are skipped and only publish-npm runs, against the existing
+  # GitHub Release.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to (re)publish to npm (e.g. v1.4.0). Must already be a published GitHub Release.
+        required: true
+        type: string
+
+# Prevent two release runs from racing on the same tag.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required for cosign keyless signing — exchanges the workflow's OIDC token
+  # for an ephemeral Fulcio cert tied to this repo + workflow identity. The
+  # in-binary updater pins that identity at verify time, so a compromise of
+  # the GitHub Releases publishing flow alone is not sufficient to push a
+  # malicious binary; an attacker would also need an OIDC token from this
+  # specific workflow path.
+  id-token: write
+
+env:
+  TAG: ${{ github.ref_name }}
+  PRIVATE_REPO: yashagldit/PocketShellApp
+
+jobs:
+  sign-and-publish:
+    name: Sign and publish
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download the build from the private repository
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          gh release download "$TAG" --repo "$PRIVATE_REPO" --dir dist
+          ls -la dist
+
+      # The checksums came with the build; this proves the download is the
+      # build, before anything is signed.
+      - name: Check every file against its checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          count=0
+          for f in *; do
+            case "$f" in
+              *.sha256) continue ;;
+            esac
+            [ -f "$f.sha256" ] || { echo "::error::$f has no $f.sha256"; exit 1; }
+            shasum -a 256 -c "$f.sha256"
+            count=$((count + 1))
+          done
+          [ "$count" -gt 0 ] || { echo "::error::the private release has no files"; exit 1; }
+          echo "$count file(s) checked"
+
+      # Pinned to v2.6.3: cosign-installer v3.8.1 cannot install cosign v3.x
+      # (it looks for the detached .sig v3 dropped). v2.6.3 has
+      # --new-bundle-format. The installer is pinned to a commit SHA so a
+      # compromised release tag of the action can't swap in another cosign.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+        with:
+          cosign-release: 'v2.6.3'
+
+      # One self-contained bundle (signature + ephemeral Fulcio cert + Rekor
+      # SET) per file, which the updater and install.sh verify offline. Each
+      # is verified against the identity they pin before anything is
+      # published, which catches a renamed or moved workflow first.
+      - name: Sign every file with cosign
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *; do
+            case "$f" in
+              *.sha256) continue ;;
+            esac
+            cosign sign-blob --yes --new-bundle-format --bundle "$f.cosign-bundle.json" "$f"
+            cosign verify-blob --new-bundle-format \
+              --bundle "$f.cosign-bundle.json" \
+              --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-host-agent.yml@${GITHUB_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$f"
+          done
+          ls -la
+
+      # A tag with a "-" (v1.4.0-rc1) is a prerelease: /releases/latest, which
+      # agents update from, never returns one.
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          body: Thumbdesk host agent ${{ env.TAG }}. Every file has a SHA-256 checksum and a Sigstore (cosign) bundle signed by this repository's release workflow.
+          prerelease: ${{ contains(env.TAG, '-') }}
+          fail_on_unmatched_files: true
+          files: dist/*
+
+      - name: Keep the signed files for the cask
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release
+          path: dist/*
+          if-no-files-found: error
+
+  # `brew install --cask yashagldit/thumbdesk/thumbdesk`: the cask in the tap,
+  # from homebrew/thumbdesk.rb with this release's version and disk image
+  # checksum. A release without the disk image (built without the notary
+  # credentials) leaves the cask on the last one that had it.
+  homebrew:
+    name: Update the Homebrew cask
+    needs: sign-and-publish
+    if: ${{ !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the signed files
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-release
+          path: dist
+
+      - name: Find the disk image
+        id: dmg
+        run: |
+          set -euo pipefail
+          sha="dist/Thumbdesk-${TAG}-aarch64-apple-darwin.dmg.sha256"
+          if [ ! -f "$sha" ]; then
+            echo "::notice::$TAG has no macOS disk image; the cask stays on the last release that had one."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(cut -d' ' -f1 "$sha")" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tap
+        if: steps.dmg.outputs.found == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: yashagldit/homebrew-thumbdesk
+          ref: main
+          path: tap
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+
+      - name: Commit the cask
+        if: steps.dmg.outputs.found == 'true'
+        env:
+          SHA256: ${{ steps.dmg.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p tap/Casks
+          sed -e "s/REPLACE_WITH_RELEASE_VERSION/${version}/" \
+              -e "s/REPLACE_WITH_DMG_SHA256/${SHA256}/" \
+              homebrew/thumbdesk.rb > tap/Casks/thumbdesk.rb
+          if grep -q REPLACE_WITH tap/Casks/thumbdesk.rb; then
+            echo "::error::the cask template still has a placeholder"
+            exit 1
+          fi
+          cd tap
+          git add Casks/thumbdesk.rb
+          if git diff --cached --quiet; then
+            echo "the cask is already on $version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "thumbdesk $version"
+          git push origin HEAD:main
+
+  # Publish to npm as a secondary distribution channel, in its own workflow
+  # so a registry outage or trusted-publisher misconfiguration cannot fail the
+  # release above. Re-run via this workflow's workflow_dispatch entry. npm pins
+  # the trusted publisher to this entry workflow's filename.
+  #
+  # Not for a prerelease: npm would make it the `latest` everyone installs.
+  publish-npm:
+    name: Publish to npm
+    needs: sign-and-publish
+    if: >-
+      always() && (
+        (github.event_name == 'push' && needs.sign-and-publish.result == 'success' && !contains(github.ref_name, '-')) ||
+        github.event_name == 'workflow_dispatch'
+      )
+    uses: ./.github/workflows/publish-npm.yml
+    with:
+      # `inputs.tag` is set only on workflow_dispatch; `github.ref_name`
+      # carries the tag on a tag-push event.
+      tag: ${{ inputs.tag || github.ref_name }}
