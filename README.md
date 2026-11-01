@@ -6,7 +6,7 @@ Thumbdesk pairs your phone with the computers you care about: your dev box, a ho
 
 **Get Thumbdesk:** [App Store](https://apps.apple.com/app/id6764135099) · [Google Play](https://play.google.com/store/apps/details?id=app.pocketshell.mobile) · [thumbdesk.com](https://thumbdesk.com/)
 
-This repository is the releases channel for the **host agent**, the program that runs on the machine you want to reach. Every release here is built by the workflow in this repository, signed with Sigstore cosign, and published with its SHA-256 checksum. The install script, the Homebrew cask and the npm wrapper live here too, so you can read exactly what runs before you run it.
+This repository is the releases channel for the **host agent**, the program that runs on the machine you want to reach. Every release here is signed with Sigstore cosign by the workflow in this repository and published with its SHA-256 checksum. The binaries are compiled in a private repository and handed to that workflow, so the signature proves a file is the one we published, not how it was built. The install script, the Homebrew cask and the npm wrapper live here too, so you can read exactly what runs before you run it.
 
 ```
 .github/workflows/  # builds, signs and publishes each release
@@ -63,7 +63,7 @@ cosign verify-blob \
   pocketshell-v2.0.0-aarch64-apple-darwin.tar.gz
 ```
 
-`thumbdesk update` runs the same checks (checksum, cosign signature, and the Apple Developer ID signature on a Mac) before it replaces anything. Asset names keep the `pocketshell-` prefix so that agents installed before the rename keep updating.
+`thumbdesk update` checks the checksum, the cosign signature when `cosign` is installed on the machine (it warns when it is not, so install cosign if you want updates signature-checked), and the Apple Developer ID signature on a Mac, before it replaces anything. Asset names keep the `pocketshell-` prefix so that agents installed before the rename keep updating.
 
 ### Source
 

@@ -225,7 +225,7 @@ Each host verifies the signature with the phone key it pinned at pairing, requir
 
 It can: see who is talking to whom and when; refuse to relay, or delay a revocation by up to 30 seconds; read terminal frames that pass through the relay path in section 5; read unsealed file operations if the exchange in section 6 fails; stop the agent or change its alert thresholds (section 4); start a terminal process that nothing can read from or type into (section 5).
 
-It cannot: pair a phone of its own choosing to a host (section 2.4); make a phone accept a key for a host other than the one on the QR (sections 2.3 and 5); read from or type into a session, open a channel, or start a share as a trusted phone (sections 4 and 5); read sealed file operations or agent chat (section 6); read anything that crosses a direct or TURN WebRTC path; or trigger a self-update of the agent (section 4).
+It cannot: pair a phone of its own choosing to a host, except by dropping the proof entirely, which 2.0.0 still accepts for older apps (section 2.4); make a phone accept a key for a host other than the one on the QR (sections 2.3 and 5); read from or type into a session, open a channel, or start a share as a trusted phone (sections 4 and 5); read sealed file operations or agent chat (section 6); read anything that crosses a direct or TURN WebRTC path; or trigger a self-update of the agent (section 4).
 
 ## 10. Test vectors
 
